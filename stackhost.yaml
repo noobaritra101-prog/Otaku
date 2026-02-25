@@ -1,6 +1,6 @@
 user:
   name: "Aritra"
-  github: "calculator-"
+  github: "calc"
 
 runtime:
   image: "python:3.11-slim"
@@ -9,7 +9,7 @@ commands:
   package: ""
   build:
     - "pip install -r requirements.txt"
-  start: "python calculatormax.py"
+  start: "python calc.py"
 
 repository:
   branch: "main"
