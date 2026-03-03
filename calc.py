@@ -441,7 +441,7 @@ async def ping_handler(message: Message):
     users, groups = await get_stats_data()
     latency = round((time.time() - start) * 1000)
     text = (
-        "🏓 **Bot is alive!**\n"
+        "🏓 <b>Pong,Bot is alive!</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         f"⏱ Latency: {latency}ms\n"
         f"👥 Users: {users}\n"
@@ -494,7 +494,7 @@ async def updatecache_handler(message: Message, bot: Bot):
         await asyncio.sleep(0.3)
 
     await message.answer(
-        f"✅ **Cache updated successfully!**\n"
+        f"✅ <b>Cache updated successfully!</b>\n"
         f"🗑 Removed: {cleaned} dead groups\n"
         f"🧠 Remaining cached chats: {len(known_chats)}"
     )
