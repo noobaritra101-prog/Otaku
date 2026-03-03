@@ -124,14 +124,12 @@ def safe_calculate(expression):
     expression = expression.replace(",", "")
     expression = expression.replace("^", "**").replace("×", "*").replace("÷", "/")
 
-    # Ignore single numbers (prevents spam like "5 = 5")
     if re.fullmatch(r"-?\d+(\.\d+)?", expression.strip()):
         return None
 
     if len(expression) > 100:
         return None
 
-    # FACTORIAL SAFETY CHECK
     if "!" in expression:
         factorials = re.findall(r'(\d+)!', expression)
         for num in factorials:
@@ -216,7 +214,7 @@ def stats_keyboard():
                 InlineKeyboardButton(
                     text="🔄 Refresh",
                     callback_data="refresh_stats",
-                    style="primary"   # 🔵 Blue
+                    style="primary"
                 )
             ]
         ]
@@ -229,26 +227,26 @@ def start_keyboard(bot_username):
                 InlineKeyboardButton(
                     text="➕ Add To Group",
                     url=f"https://t.me/{bot_username}?startgroup=true",
-                    style="success"   # 🟢 Green
+                    style="success"
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="💬 Support",
                     url="https://t.me/axbsupport",
-                    style="primary"   # 🔵 Blue
+                    style="primary"
                 ),
                 InlineKeyboardButton(
                     text="🏢 HQ",
                     url="https://t.me/your_channel",
-                    style="primary"   # 🔵 Blue
+                    style="primary"
                 ),
             ],
             [
                 InlineKeyboardButton(
                     text="👑 Owner",
                     url="https://t.me/axbowners",
-                    style="danger"    # 🔴 Red
+                    style="danger"
                 )
             ]
         ]
@@ -354,16 +352,8 @@ async def on_bot_added(message: Message, bot: Bot):
             markup = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(
-                            text="💬 Support", 
-                            url="https://t.me/axbsupport",
-                            style="primary"
-                        ),
-                        InlineKeyboardButton(
-                            text="🏢 Updates", 
-                            url="https://t.me/your_channel",
-                            style="primary"
-                        )
+                        InlineKeyboardButton(text="💬 Support", url="https://t.me/axbsupport", style="primary"),
+                        InlineKeyboardButton(text="🏢 Updates", url="https://t.me/your_channel", style="primary")
                     ]
                 ]
             )
@@ -497,12 +487,11 @@ async def updatecache_handler(message: Message, bot: Bot):
             if member.status in ["left", "kicked"]:
                 raise Exception("removed")
         except Exception:
-            # Bot is no longer in the group → clean it
             async with db_pool.acquire() as conn:
                 await conn.execute("DELETE FROM chats WHERE chat_id = $1", chat_id)
             known_chats.discard(chat_id)
             cleaned += 1
-        await asyncio.sleep(0.3)  # Safe rate limit
+        await asyncio.sleep(0.3)
 
     await message.answer(
         f"✅ **Cache updated successfully!**\n"
@@ -572,31 +561,28 @@ async def main():
     await create_pool()
     await init_db()
 
-    # Original commands
+    # === ALL SPECIFIC COMMANDS FIRST ===
     dp.message.register(start_handler, Command("start"))
     dp.message.register(stats_handler, Command("stats"))
-    
     dp.message.register(integrate_handler, Command("int", "integrate"))
     dp.message.register(differentiate_handler, Command("diff", "differentiate", "dif"))
     dp.message.register(solve_handler, Command("solve"))
-
     dp.message.register(group_info, Command("groupinfo"))
-    dp.message.register(on_bot_added, F.new_chat_members)
-
     dp.message.register(broadcast_groups, Command("broadcast"))
     dp.message.register(broadcast_users, Command("broad"))
 
-    dp.callback_query.register(refresh_callback, F.data == "refresh_stats")
-    
-    dp.inline_query.register(inline_calculator)
-    dp.message.register(message_handler)
-
-    # New minimal admin commands
+    # === NEW ADMIN COMMANDS (now in correct order) ===
     dp.message.register(ping_handler, Command("ping"))
     dp.message.register(users_handler, Command("users"))
     dp.message.register(updatecache_handler, Command("updatecache"))
 
-    print("Bot running at lightning speed with Strict Math Filter, RAM protection, Rate Limiting & Smart Cache Update...⚡")
+    # === CALLBACK, INLINE & GENERAL MATH (LAST) ===
+    dp.callback_query.register(refresh_callback, F.data == "refresh_stats")
+    dp.message.register(on_bot_added, F.new_chat_members)
+    dp.inline_query.register(inline_calculator)
+    dp.message.register(message_handler)
+
+    print("Bot running at lightning speed... All admin commands fixed! ⚡")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
