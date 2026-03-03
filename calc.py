@@ -113,33 +113,31 @@ async def get_group_names():
 
 def is_math_expression(text):
     text = text.lower()
-    # Added trig functions and 'factorial' to the valid words list
     valid_words = ['sin', 'cos', 'tan', 'sec', 'csc', 'cot', 'log', 'ln', 'sqrt', 'abs', 'round', 'pi', 'e', 'factorial']
     for word in valid_words:
         text = re.sub(r'\b' + word + r'\b', '', text)
         
     text = text.replace('x', '')
-    # Added ! to the allowed math symbols
     return bool(re.fullmatch(r'[\d\.\+\-\*\/\^\(\)\s\%\=,\!]+', text))
 
 def safe_calculate(expression):
     expression = expression.replace(",", "")
     expression = expression.replace("^", "**").replace("×", "*").replace("÷", "/")
 
+    # Ignore single numbers (prevents spam like "5 = 5")
     if re.fullmatch(r"-?\d+(\.\d+)?", expression.strip()):
         return None
 
     if len(expression) > 100:
         return None
 
-    # FACTORIAL SAFETY CHECK: Block any factorial larger than 150!
+    # FACTORIAL SAFETY CHECK
     if "!" in expression:
         factorials = re.findall(r'(\d+)!', expression)
         for num in factorials:
             if int(num) > 150:
                 return "⚠️ Number too large for factorial! Keep it under 150."
         
-        # Translate 7! into factorial(7) for Python to read
         expression = re.sub(r'(\d+)!', r'factorial(\1)', expression)
 
     if expression.count("**") > 1:
@@ -209,7 +207,7 @@ def solve_equation(expression):
     except Exception:
         return None
 
-# ================= COLORED BUTTONS =================
+# ================= COLORED BUTTONS (Telegram API 9.4+) =================
 
 def stats_keyboard():
     return InlineKeyboardMarkup(
@@ -218,7 +216,7 @@ def stats_keyboard():
                 InlineKeyboardButton(
                     text="🔄 Refresh",
                     callback_data="refresh_stats",
-                    api_kwargs={"style": "primary"}  # 🔵 Blue
+                    style="primary"   # 🔵 Blue
                 )
             ]
         ]
@@ -356,8 +354,16 @@ async def on_bot_added(message: Message, bot: Bot):
             markup = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(text="💬 Support", url="https://t.me/axbsupport"),
-                        InlineKeyboardButton(text="🏢 Updates", url="https://t.me/your_channel")
+                        InlineKeyboardButton(
+                            text="💬 Support", 
+                            url="https://t.me/axbsupport",
+                            style="primary"
+                        ),
+                        InlineKeyboardButton(
+                            text="🏢 Updates", 
+                            url="https://t.me/your_channel",
+                            style="primary"
+                        )
                     ]
                 ]
             )
@@ -436,6 +442,74 @@ async def broadcast_users(message: Message, bot: Bot):
     count = await safe_broadcast(bot, users, message.chat.id, message.reply_to_message.message_id)
     await msg.edit_text(f"✅ Successfully broadcasted to {count} users.")
 
+# ================= MINIMAL ADMIN COMMANDS =================
+
+async def ping_handler(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    start = time.time()
+    users, groups = await get_stats_data()
+    latency = round((time.time() - start) * 1000)
+    text = (
+        "🏓 **Bot is alive!**\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"⏱ Latency: {latency}ms\n"
+        f"👥 Users: {users}\n"
+        f"🌐 Groups: {groups}\n"
+        f"🧠 Cached Chats: {len(known_chats)}"
+    )
+    await message.answer(text)
+
+
+async def users_handler(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    users = await get_all_users()
+    if not users:
+        await message.answer("⚠️ No private users found.")
+        return
+    text = "👤 <b>Private Users List</b>\n\n"
+    for i, row in enumerate(users, 1):
+        text += f"<b>{i}.</b> <code>{row['chat_id']}</code>\n"
+    if len(text) > 4000:
+        text = text[:3900] + "\n... (truncated)"
+    await message.answer(text)
+
+
+async def updatecache_handler(message: Message, bot: Bot):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    groups = await get_all_groups()
+    if not groups:
+        await message.answer("✅ No groups to check.")
+        return
+
+    await message.answer(f"🔄 Checking {len(groups)} groups for dead entries...\nThis may take a few seconds.")
+
+    cleaned = 0
+    me = await bot.get_me()
+
+    for row in groups:
+        chat_id = row['chat_id']
+        try:
+            member = await bot.get_chat_member(chat_id, me.id)
+            if member.status in ["left", "kicked"]:
+                raise Exception("removed")
+        except Exception:
+            # Bot is no longer in the group → clean it
+            async with db_pool.acquire() as conn:
+                await conn.execute("DELETE FROM chats WHERE chat_id = $1", chat_id)
+            known_chats.discard(chat_id)
+            cleaned += 1
+        await asyncio.sleep(0.3)  # Safe rate limit
+
+    await message.answer(
+        f"✅ **Cache updated successfully!**\n"
+        f"🗑 Removed: {cleaned} dead groups\n"
+        f"🧠 Remaining cached chats: {len(known_chats)}"
+    )
+
 # --- Standard Math Handler ---
 
 async def message_handler(message: Message):
@@ -498,6 +572,7 @@ async def main():
     await create_pool()
     await init_db()
 
+    # Original commands
     dp.message.register(start_handler, Command("start"))
     dp.message.register(stats_handler, Command("stats"))
     
@@ -516,7 +591,12 @@ async def main():
     dp.inline_query.register(inline_calculator)
     dp.message.register(message_handler)
 
-    print("Bot running at lightning speed with Strict Math Filter, RAM protection, and Rate Limiting...⚡")
+    # New minimal admin commands
+    dp.message.register(ping_handler, Command("ping"))
+    dp.message.register(users_handler, Command("users"))
+    dp.message.register(updatecache_handler, Command("updatecache"))
+
+    print("Bot running at lightning speed with Strict Math Filter, RAM protection, Rate Limiting & Smart Cache Update...⚡")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
