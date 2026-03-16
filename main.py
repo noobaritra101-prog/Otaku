@@ -1,0 +1,669 @@
+import logging
+import math
+import asyncio
+import re
+import hashlib
+import time
+import json
+import os
+import sympy as sp
+from datetime import datetime
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    FSInputFile
+)
+from aiogram.filters import Command
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+
+# ================= CONFIG =================
+
+TOKEN = "8368723938:AAF13FzPY8V4hCWhCLY_zJZFT-K7GdYZhoI"
+ADMIN_IDS = [5716292610, 7708811819]
+DATA_FILE = "database.json"
+
+logging.basicConfig(level=logging.INFO)
+START_TIME = datetime.now()
+
+# ================= RATE LIMITER MIDDLEWARE =================
+
+class RateLimitMiddleware(BaseMiddleware):
+    def __init__(self, limit: float = 1.5):
+        self.limit = limit
+        self.users = {}
+
+    async def __call__(self, handler, event: Message, data: dict):
+        if not isinstance(event, Message) or not event.from_user:
+            return await handler(event, data)
+            
+        user_id = event.from_user.id
+        if user_id in ADMIN_IDS:
+            return await handler(event, data)
+
+        current_time = time.time()
+        if user_id in self.users:
+            time_passed = current_time - self.users[user_id]
+            if time_passed < self.limit:
+                return 
+        
+        self.users[user_id] = current_time
+        return await handler(event, data)
+
+# ================= TEMPORARY JSON DATABASE =================
+
+db_memory = {}
+known_chats = set()
+
+def load_data():
+    global db_memory, known_chats
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                db_memory = json.load(f)
+                # Convert string keys back to int for the known_chats set
+                known_chats = set(int(k) for k in db_memory.keys())
+        except Exception as e:
+            logging.error(f"Failed to load DB: {e}")
+            db_memory = {}
+            known_chats = set()
+    else:
+        db_memory = {}
+        known_chats = set()
+
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(db_memory, f, indent=4)
+
+async def init_db():
+    load_data()
+
+async def add_chat(chat_id, chat_type, name):
+    if chat_id in known_chats:
+        return
+    
+    known_chats.add(chat_id)
+    db_memory[str(chat_id)] = {
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+        "first_name": name,
+        "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    save_data()
+
+async def get_stats_data():
+    users = sum(1 for v in db_memory.values() if v["chat_type"] == "private")
+    groups = sum(1 for v in db_memory.values() if v["chat_type"] != "private")
+    return users, groups
+
+async def get_all_groups():
+    return [{"chat_id": v["chat_id"]} for v in db_memory.values() if v["chat_type"] != "private"]
+
+async def get_all_users():
+    return [{"chat_id": v["chat_id"]} for v in db_memory.values() if v["chat_type"] == "private"]
+
+async def get_group_names():
+    return [{"first_name": v["first_name"]} for v in db_memory.values() if v["chat_type"] != "private"]
+
+# ================= EXPORT & IMPORT LOGIC =================
+
+async def export_db_data():
+    return list(db_memory.values())
+
+async def import_db_data(data):
+    count = 0
+    for item in data:
+        try:
+            cid = item.get('chat_id')
+            if cid is None:
+                continue
+            
+            db_memory[str(cid)] = {
+                "chat_id": cid,
+                "chat_type": item.get('chat_type', 'private'),
+                "first_name": item.get('first_name', 'Unknown'),
+                "date_added": item.get('date_added', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            }
+            known_chats.add(cid)
+            count += 1
+        except Exception as e:
+            logging.error(f"Import error for {item}: {e}")
+            
+    save_data()
+    return count
+
+# ================= MATH LOGIC & FILTERS =================
+
+def is_math_expression(text):
+    text = text.lower()
+    valid_words = ['sin', 'cos', 'tan', 'sec', 'csc', 'cot', 'log', 'ln', 'sqrt', 'abs', 'round', 'pi', 'e', 'factorial']
+    for word in valid_words:
+        text = re.sub(r'\b' + word + r'\b', '', text)
+        
+    text = text.replace('x', '')
+    return bool(re.fullmatch(r'[\d\.\+\-\*\/\^\(\)\s\%\=,\!]+', text))
+
+def safe_calculate(expression):
+    expression = expression.replace(",", "")
+    expression = expression.replace("^", "**").replace("×", "*").replace("÷", "/")
+
+    if re.fullmatch(r"-?\d+(\.\d+)?", expression.strip()):
+        return None
+
+    if len(expression) > 100:
+        return None
+
+    if "!" in expression:
+        factorials = re.findall(r'(\d+)!', expression)
+        for num in factorials:
+            if int(num) > 150:
+                return "⚠️ Number too large for factorial! Keep it under 150."
+        
+        expression = re.sub(r'(\d+)!', r'factorial(\1)', expression)
+
+    if expression.count("**") > 1:
+        return "∞"
+    if "**" in expression:
+        parts = expression.split("**")
+        if any(len(p.strip()) > 3 for p in parts):
+            return "∞"
+
+    safe_dict = {k: v for k, v in math.__dict__.items() if not k.startswith("__")}
+    safe_dict["abs"] = abs
+    safe_dict["round"] = round
+
+    try:
+        result = eval(expression, {"__builtins__": {}}, safe_dict)
+        return str(result)
+    except OverflowError:
+        return "∞"
+    except:
+        return None
+
+def do_calculus(expression, operation):
+    if len(expression) > 100:
+        return "⚠️ Expression too long! Keep it under 100 characters."
+    if expression.count("^") > 3 or expression.count("**") > 3:
+        return "⚠️ Too many exponents! My server doesn't have enough RAM for that."
+
+    try:
+        x = sp.Symbol('x')
+        expr = sp.sympify(expression.replace("^", "**"))
+        
+        if operation == 'diff':
+            result = sp.diff(expr, x)
+        elif operation == 'int':
+            result = sp.integrate(expr, x)
+            
+        return str(result).replace("**", "^")
+    except Exception:
+        return "⚠️ Calculus Error: Check your formatting. Example: sin(x) + x^2"
+
+def solve_equation(expression):
+    if len(expression) > 100:
+        return None
+    if expression.count("^") > 3 or expression.count("**") > 3:
+        return "⚠️ Equation too complex! I can't solve that many exponents."
+
+    try:
+        expression = expression.replace("^", "**").replace("×", "*").replace("÷", "/")
+        if "=" not in expression:
+            return None
+            
+        left_side, right_side = expression.split("=", 1)
+        x = sp.Symbol('x')
+        
+        left_expr = sp.sympify(left_side)
+        right_expr = sp.sympify(right_side)
+        
+        equation = sp.Eq(left_expr, right_expr)
+        solutions = sp.solve(equation, x)
+        
+        if not solutions:
+            return "No solution found."
+            
+        result_str = ", ".join([str(sol).replace("**", "^") for sol in solutions])
+        return f"x = {result_str}"
+        
+    except Exception:
+        return None
+
+# ================= COLORED BUTTONS =================
+
+def stats_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Refresh",
+                    callback_data="refresh_stats",
+                    style="primary"
+                )
+            ]
+        ]
+    )
+
+def start_keyboard(bot_username):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Add To Group",
+                    url=f"https://t.me/{bot_username}?startgroup=true",
+                    style="success"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Support",
+                    url="https://t.me/axbsupport",
+                    style="primary"
+                ),
+                InlineKeyboardButton(
+                    text="🏢 HQ",
+                    url="https://t.me/your_channel",
+                    style="primary"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👑 Owner",
+                    url="https://t.me/axbowners",
+                    style="danger"
+                )
+            ]
+        ]
+    )
+
+# ================= HANDLERS =================
+
+async def start_handler(message: Message, bot: Bot):
+    asyncio.create_task(add_chat(message.chat.id, message.chat.type, message.chat.title or message.from_user.first_name))
+
+    text = (
+        f"Hҽყ {message.from_user.first_name}\n"
+        "Wᴇʟᴄσɱᴇ ᴛσ Tʜᴇ Cᴀʟᴄᴜʟᴀᴛᴏʀ Bᴏᴛ\n\n"
+        "⚡ Pᴏᴡᴇʀᴇᴅ ʙʏ AｘB Bᴏᴛs"
+    )
+    me = await bot.get_me()
+    await message.answer(text, reply_markup=start_keyboard(me.username))
+
+async def stats_handler(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    users, groups = await get_stats_data()
+    uptime = datetime.now() - START_TIME
+    uptime_str = str(uptime).split('.')[0]
+
+    text = (
+        "📊 <b>System Status</b>\n"
+        "──────────────\n"
+        f"⏱ Uptime: {uptime_str}\n"
+        f"👥 Users: {users}\n"
+        f"🌐 Groups: {groups}\n"
+        f"🧠 Cached Chats: {len(known_chats)}"
+    )
+    await message.answer(text, reply_markup=stats_keyboard())
+
+async def refresh_callback(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Not Admin", show_alert=True)
+        return
+
+    users, groups = await get_stats_data()
+    uptime = datetime.now() - START_TIME
+    uptime_str = str(uptime).split('.')[0]
+
+    text = (
+        "📊 <b>System Status</b>\n"
+        "──────────────\n"
+        f"⏱ Uptime: {uptime_str}\n"
+        f"👥 Users: {users}\n"
+        f"🌐 Groups: {groups}\n"
+        f"🧠 Cached Chats: {len(known_chats)}"
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=stats_keyboard())
+        await callback.answer("Updated")
+    except:
+        await callback.answer("Already up to date!", show_alert=False)
+
+# --- Group Greetings & Info ---
+
+async def group_info(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    groups = await get_group_names()
+    if not groups:
+        await message.answer("⚠️ <b>No groups found in the database.</b>")
+        return
+
+    text = (
+        "━━━━━━━━━━━━━━━━\n"
+        "📂 <b>AxB Calculator | Group List</b>\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+    )
+    
+    for i, row in enumerate(groups, 1):
+        name = str(row['first_name']).replace("<", "&lt;").replace(">", "&gt;")
+        text += f"<b>{i}.</b> {name}\n"
+
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n... <i>(List truncated)</i>"
+
+    text += "\n━━━━━━━━━━━━━━━━"
+    await message.answer(text)
+
+async def on_bot_added(message: Message, bot: Bot):
+    for new_member in message.new_chat_members:
+        if new_member.id == bot.id:
+            await add_chat(message.chat.id, message.chat.type, message.chat.title)
+            text = (
+                "━━━━━━━━━━━━━━━━\n"
+                f"👋 <b>Hello, {message.chat.title}!</b>\n"
+                "━━━━━━━━━━━━━━━━\n"
+                f"Thanks to <a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a> for adding me! ⚡️\n\n"
+                "🧮 <b>What I can do:</b>\n"
+                "➤ <b>Basic Math:</b> Just type `50 * 12` or `7!`\n"
+                "➤ <b>Algebra:</b> Type `x^2 = 16`\n"
+                "➤ <b>Calculus:</b> Use `/int sin(x)` or `/diff x^2`\n\n"
+                "<i>Just send your math problems directly in the chat!</i>\n"
+                "━━━━━━━━━━━━━━━━"
+            )
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="💬 Support", url="https://t.me/axbsupport", style="primary"),
+                        InlineKeyboardButton(text="🏢 Updates", url="https://t.me/your_channel", style="primary")
+                    ]
+                ]
+            )
+            await message.answer(text, reply_markup=markup)
+            return
+
+# --- Calculus & Algebra Handlers ---
+
+async def integrate_handler(message: Message):
+    asyncio.create_task(add_chat(message.chat.id, message.chat.type, message.chat.title or message.from_user.first_name))
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Please provide an expression. Example: `/int sin(x)`")
+        return
+    result = await asyncio.to_thread(do_calculus, args[1], 'int')
+    await message.answer(f"∫({args[1]}) dx\n\n= <b>{result}</b>")
+
+async def differentiate_handler(message: Message):
+    asyncio.create_task(add_chat(message.chat.id, message.chat.type, message.chat.title or message.from_user.first_name))
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Please provide an expression. Example: `/diff cos(x)`")
+        return
+    result = await asyncio.to_thread(do_calculus, args[1], 'diff')
+    await message.answer(f"d/dx ({args[1]})\n\n= <b>{result}</b>")
+
+async def solve_handler(message: Message):
+    asyncio.create_task(add_chat(message.chat.id, message.chat.type, message.chat.title or message.from_user.first_name))
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Please provide an equation. Example: `/solve 2*x + 10 = 20`")
+        return
+    result = await asyncio.to_thread(solve_equation, args[1].lower())
+    if result:
+        await message.answer(f"📝 {args[1]}\n\n👉 <b>{result}</b>")
+
+# --- Broadcast Handlers ---
+
+async def safe_broadcast(bot: Bot, chat_ids: list, from_chat_id: int, message_id: int):
+    count = 0
+    batch_size = 25
+    for i in range(0, len(chat_ids), batch_size):
+        batch = chat_ids[i:i + batch_size]
+        tasks = [
+            bot.copy_message(chat_id=row['chat_id'], from_chat_id=from_chat_id, message_id=message_id)
+            for row in batch
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if not isinstance(res, Exception):
+                count += 1
+        await asyncio.sleep(1)
+    return count
+
+async def broadcast_groups(message: Message, bot: Bot):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not message.reply_to_message:
+        await message.reply("⚠️ Reply to a message to broadcast.")
+        return
+
+    groups = await get_all_groups()
+    msg = await message.answer(f"📢 Broadcasting to {len(groups)} groups at high speed...")
+    count = await safe_broadcast(bot, groups, message.chat.id, message.reply_to_message.message_id)
+    await msg.edit_text(f"✅ Successfully broadcasted to {count} groups.")
+
+async def broadcast_users(message: Message, bot: Bot):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not message.reply_to_message:
+        await message.reply("⚠️ Reply to a message to broadcast.")
+        return
+
+    users = await get_all_users()
+    msg = await message.answer(f"📢 Broadcasting to {len(users)} users at high speed...")
+    count = await safe_broadcast(bot, users, message.chat.id, message.reply_to_message.message_id)
+    await msg.edit_text(f"✅ Successfully broadcasted to {count} users.")
+
+# ================= MINIMAL ADMIN COMMANDS =================
+
+async def ping_handler(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    start = time.time()
+    users, groups = await get_stats_data()
+    latency = round((time.time() - start) * 1000)
+    text = (
+        "🏓 <b>Pong,Bot is alive!</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"⏱ Latency: {latency}ms\n"
+        f"👥 Users: {users}\n"
+        f"🌐 Groups: {groups}\n"
+        f"🧠 Cached Chats: {len(known_chats)}"
+    )
+    await message.answer(text)
+
+
+async def users_handler(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    users = await get_all_users()
+    if not users:
+        await message.answer("⚠️ No private users found.")
+        return
+    text = "👤 <b>Private Users List</b>\n\n"
+    for i, row in enumerate(users, 1):
+        text += f"<b>{i}.</b> <code>{row['chat_id']}</code>\n"
+    if len(text) > 4000:
+        text = text[:3900] + "\n... (truncated)"
+    await message.answer(text)
+
+
+async def updatecache_handler(message: Message, bot: Bot):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    groups = await get_all_groups()
+    if not groups:
+        await message.answer("✅ No groups to check.")
+        return
+
+    await message.answer(f"🔄 Checking {len(groups)} groups for dead entries...\nThis may take a few seconds.")
+
+    cleaned = 0
+    me = await bot.get_me()
+
+    for row in groups:
+        chat_id = row['chat_id']
+        try:
+            member = await bot.get_chat_member(chat_id, me.id)
+            if member.status in ["left", "kicked"]:
+                raise Exception("removed")
+        except Exception:
+            str_cid = str(chat_id)
+            if str_cid in db_memory:
+                del db_memory[str_cid]
+            known_chats.discard(chat_id)
+            cleaned += 1
+        await asyncio.sleep(0.3)
+        
+    save_data()
+
+    await message.answer(
+        f"✅ <b>Cache updated successfully!</b>\n"
+        f"🗑 Removed: {cleaned} dead groups\n"
+        f"🧠 Remaining cached chats: {len(known_chats)}"
+    )
+
+# --- Database Migration Handlers ---
+
+async def export_handler(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    data = await export_db_data()
+    file_path = "temp_db_export.json"
+    
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    
+    await message.answer_document(
+        document=FSInputFile(file_path),
+        caption=f"📂 <b>Database Export</b>\nTotal Records: {len(data)}\n\n<i>Reply to this file with 'import' to restore it.</i>"
+    )
+    os.remove(file_path)
+
+async def import_msg_handler(message: Message, bot: Bot):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    if not message.reply_to_message or not message.reply_to_message.document:
+        return
+    
+    if message.text.lower() != "import":
+        return
+
+    status_msg = await message.answer("⏳ Processing import...")
+    
+    try:
+        file_id = message.reply_to_message.document.file_id
+        file = await bot.get_file(file_id)
+        file_path = f"import_{file_id}.json"
+        await bot.download_file(file.file_path, file_path)
+        
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        count = await import_db_data(data)
+        await status_msg.edit_text(f"✅ <b>Import Successful!</b>\nInserted/Updated {count} records.")
+        os.remove(file_path)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ <b>Import Failed</b>\nError: <code>{str(e)}</code>")
+
+# --- Standard Math Handler ---
+
+async def message_handler(message: Message):
+    if not message.text:
+        return
+
+    if message.text.startswith('/'):
+        return
+
+    if not is_math_expression(message.text):
+        return
+
+    asyncio.create_task(add_chat(message.chat.id, message.chat.type, message.chat.title or message.from_user.first_name))
+
+    if "=" in message.text and "x" in message.text.lower():
+        result = await asyncio.to_thread(solve_equation, message.text.lower())
+        if result and not result.startswith("⚠️"):
+            await message.answer(f"📝 {message.text}\n\n👉 <b>{result}</b>")
+        return
+
+    result = await asyncio.to_thread(safe_calculate, message.text)
+    if result:
+        await message.answer(f"{message.text} = {result}")
+
+# --- Inline Query Handler ---
+
+async def inline_calculator(inline_query: InlineQuery):
+    text = inline_query.query or ""
+    if not text:
+        return
+
+    result = await asyncio.to_thread(safe_calculate, text)
+    if not result:
+        return
+
+    result_id = hashlib.md5(text.encode()).hexdigest()
+    
+    item = InlineQueryResultArticle(
+        id=result_id,
+        title=f"Result: {result}",
+        input_message_content=InputTextMessageContent(
+            message_text=f"{text} = {result}",
+            parse_mode=ParseMode.HTML
+        ),
+        description=f"Calculate {text}"
+    )
+    await inline_query.answer([item], cache_time=1)
+
+# ================= MAIN =================
+
+async def main():
+    bot = Bot(
+        TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+
+    dp.message.middleware(RateLimitMiddleware(limit=1.5))
+
+    await init_db()
+
+    # === ALL SPECIFIC COMMANDS FIRST ===
+    dp.message.register(start_handler, Command("start"))
+    dp.message.register(stats_handler, Command("stats"))
+    dp.message.register(integrate_handler, Command("int", "integrate"))
+    dp.message.register(differentiate_handler, Command("diff", "differentiate", "dif"))
+    dp.message.register(solve_handler, Command("solve"))
+    dp.message.register(group_info, Command("groupinfo"))
+    dp.message.register(broadcast_groups, Command("broadcast"))
+    dp.message.register(broadcast_users, Command("broad"))
+
+    # === NEW ADMIN COMMANDS ===
+    dp.message.register(ping_handler, Command("ping"))
+    dp.message.register(users_handler, Command("users"))
+    dp.message.register(updatecache_handler, Command("updatecache"))
+    
+    # === EXPORT / IMPORT COMMANDS ===
+    dp.message.register(export_handler, Command("export"))
+    dp.message.register(import_msg_handler, F.text.lower() == "import")
+
+    # === CALLBACK, INLINE & GENERAL MATH (LAST) ===
+    dp.callback_query.register(refresh_callback, F.data == "refresh_stats")
+    dp.message.register(on_bot_added, F.new_chat_members)
+    dp.inline_query.register(inline_calculator)
+    dp.message.register(message_handler)
+
+    print("Bot running at lightning speed with Local JSON Database! ⚡")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
