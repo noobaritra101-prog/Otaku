@@ -460,6 +460,7 @@ class GuessGame:
     thread: int | None
     msg_id: int
     char: object
+    rich: bool = False                      # the game message is a rich message (else a normal picture)
     started: float = field(default_factory=time.time)
     done: bool = False
     task: asyncio.Task | None = None
@@ -473,16 +474,21 @@ _guess_wins: dict[int, list[float]] = {}    # user id -> [window start, paid win
 
 
 async def _guess_reveal(bot, g: GuessGame, title: str) -> None:
-    """Edit the game picture's caption to show the answer."""
+    """Edit the game message (picture stays, spoiler off) to show the answer."""
     from drop import name_tag
     from waifu import rarity_label
     c = g.char
-    caption = (f"<b>{escape(title)}</b>\n<blockquote>{escape(name_tag(c))}\n"
-               f"{escape(c['anime'])} · {rarity_label(c['rarity'])}</blockquote>")
+    n, tail = name_tag(c), f"{c['anime']} · {rarity_label(c['rarity'])}"
+    md = f"## {esc(title)}\n\n> {esc(n)}\n>\n> {esc(tail)}"
+    html = f"<b>{escape(title)}</b>\n<blockquote>{escape(n)}\n{escape(tail)}</blockquote>"
     try:
-        await bot.edit_message_caption(chat_id=g.chat_id, message_id=g.msg_id, caption=caption)
+        if g.rich:
+            await richmsg.edit_rich(bot, g.chat_id, g.msg_id, md, media=(c["file_id"], c["media_type"]))
+        else:
+            await bot.edit_message_caption(chat_id=g.chat_id, message_id=g.msg_id, caption=html)
     except TelegramAPIError as e:
-        log.debug("whoami reveal failed in %s: %s", g.chat_id, e)
+        if "not modified" not in str(e).lower():
+            log.warning("whoami reveal failed in %s: %s", g.chat_id, e)
 
 
 def _guess_close(g: GuessGame) -> None:
@@ -523,16 +529,28 @@ async def whoami_cmd(m: Message):
         c = await pick_drop(_guess_last.get(cid))
         if not c:
             return await notice(m, "Who am I", "No characters available yet.")
+        md = (f"## Guess the character !\n\n> Type the name in the chat within {GUESS_SECONDS} seconds.\n>\n"
+              f"> Reward: {GUESS_REWARD} {CURRENCY_SYMBOL}").replace("!", "\\!")
         caption = (
             "<b>Guess the character !</b>\n"
             f"<blockquote>Type the name in the chat within {GUESS_SECONDS} seconds.\n"
             f"Reward: {GUESS_REWARD} {CURRENCY_SYMBOL}</blockquote>")
-        try:
-            msg = await send_media(m, c["media_type"], c["file_id"], caption, spoiler=True)
-        except TelegramAPIError as e:
-            log.warning("whoami send failed in %s (card %s): %s", cid, c["char_id"], e)
-            return await notice(m, "Something went wrong", "Try again in a moment.")
-        g = GuessGame(chat_id=cid, thread=topic_id(m), msg_id=msg.message_id, char=c)
+        msg, is_rich = None, False
+        if RICH_MESSAGES:                           # picture as a media block (spoiler) inside a rich message
+            try:
+                kw = {"reply_to_message_id": m.message_id} if _RICH_CAN_REPLY else {}
+                msg = await richmsg.send_rich(m.bot, cid, md, media=(c["file_id"], c["media_type"]),
+                                              message_thread_id=topic_id(m), spoiler=True, **kw)
+                is_rich = True
+            except Exception as e:
+                log.warning("rich whoami failed in %s, using a normal picture: %s", cid, e)
+        if msg is None:
+            try:
+                msg = await send_media(m, c["media_type"], c["file_id"], caption, spoiler=True)
+            except TelegramAPIError as e:
+                log.warning("whoami send failed in %s (card %s): %s", cid, c["char_id"], e)
+                return await notice(m, "Something went wrong", "Try again in a moment.")
+        g = GuessGame(chat_id=cid, thread=topic_id(m), msg_id=msg.message_id, char=c, rich=is_rich)
         _guess_games[cid] = g
         _guess_last[cid] = c["char_id"]
         g.task = asyncio.create_task(_guess_timeout(m.bot, g))

@@ -90,14 +90,14 @@ async def run_backup(bot) -> tuple[bool, str]:
                 CHAT, BufferedInputFile(data, filename=name),
                 caption=f"<b>Database backup</b>\n{now} · {len(data) / 1024:.0f} KB",
                 disable_notification=True)
-            await bot.pin_chat_message(CHAT, sent.message_id, disable_notification=True)
+            await bot.pin_chat_message(chat_id=CHAT, message_id=sent.message_id, disable_notification=True)
             if _is_backup(prev) and prev.message_id != sent.message_id:
                 try:
-                    await bot.unpin_chat_message(CHAT, prev.message_id)
+                    await bot.unpin_chat_message(chat_id=CHAT, message_id=prev.message_id)
                 except TelegramAPIError as e:
                     log.warning("unpin old backup failed: %s", e)
                 try:
-                    await bot.delete_message(CHAT, prev.message_id)
+                    await bot.delete_message(chat_id=CHAT, message_id=prev.message_id)
                 except TelegramAPIError as e:
                     log.warning("delete old backup failed: %s", e)
             log.info("backup sent (%s, %d bytes)", name, len(data))

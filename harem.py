@@ -9,9 +9,8 @@
 - Fallback: photo with an HTML caption, then plain text.
 
 Also here: /topplayers leaderboard and /settplayer (set its video / GIF / picture).
-- Rich message with the /settplayer media on top (a media block), a table of the top TOPPLAYERS_COUNT and three
-  toggle buttons: Nex (richest players), Collection (most unique characters) and Waifus (characters owned by the
-  most people). The same message is edited. Only the person who used /topplayers can press the buttons.
+- Rich message with the /settplayer media on top (a media block), a numbered list (inside a quote) of the top TOPPLAYERS_COUNT and two
+  toggle buttons: Nex (richest players) and Collection (most unique characters). The same message is edited. Only the person who used /topplayers can press the buttons.
 - Fallbacks: rich + media, rich, HTML media caption, HTML text; each with coloured then plain buttons.
 - /settplayer (owner and co-owners): reply to a photo / video / GIF, stored as a file_id in settings.
 """
@@ -185,17 +184,13 @@ async def harem_cb(call: CallbackQuery):
 
 # ═════════════ /topplayers leaderboard ═════════════
 SYM = CURRENCY_SYMBOL
-VIEWS = (("nex", CURRENCY_NAME), ("col", "Collection"), ("wai", "Waifus"))
+VIEWS = (("nex", CURRENCY_NAME), ("col", "Collection"))
 VIEW_TITLE = dict(VIEWS)
 
 
 # ───────────── data ─────────────
 def cut(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
-
-
-def card_name(c) -> str:
-    return c["name"] + (f" ({sub_emoji(c['sub_rarity'])})" if c["sub_rarity"] else "")
 
 
 def name_of(r) -> str:
@@ -208,27 +203,22 @@ async def banner() -> tuple[str, str] | None:
 
 
 def board_view(view: str, rows) -> tuple[str, str]:
-    """(rich markdown, html fallback)."""
+    """(rich markdown, html fallback): a numbered list inside a quote, no table."""
     label = VIEW_TITLE[view]
-    if view == "nex":
-        head, aligns = ("#", "Player", CURRENCY_NAME), "|---:|---|---:|"
-        body = [(str(i), name_of(r), f"{r['nex']:,} {SYM}") for i, r in enumerate(rows, 1)]
-    elif view == "wai":
-        head, aligns = ("#", "Waifu", "Rarity", "Owners"), "|---:|---|---|---:|"
-        body = [(str(i), cut(card_name(r), 24), f"{RAR_EMO.get(r['rarity'], '')} {r['rarity']}".strip(),
-                 f"{r['owners']:,}") for i, r in enumerate(rows, 1)]
+    lines_md, lines_h = [], []
+    for i, r in enumerate(rows, 1):
+        name = name_of(r)
+        if view == "nex":
+            tail = f"{r['nex']:,} {SYM}"
+        else:
+            tail = f"{r['uniq']:,} unique · {r['copies']:,} copies"
+        lines_md.append(f"> {i}. **{esc(name)}** · {esc(tail)}")
+        lines_h.append(f"{i}. <b>{escape(name)}</b> · {escape(tail)}")
+    if lines_md:
+        md = f"## Top players\n\nBy {esc(label)}\n\n" + "\n".join(lines_md)
+        inner = "\n".join(lines_h)
     else:
-        head, aligns = ("#", "Player", "Unique", "Copies"), "|---:|---|---:|---:|"
-        body = [(str(i), name_of(r), f"{r['uniq']:,}", f"{r['copies']:,}") for i, r in enumerate(rows, 1)]
-
-    md = f"## Top players\n\nBy {esc(label)}\n\n"
-    if body:
-        md += "| " + " | ".join(esc(h) for h in head) + " |\n" + aligns + "\n"
-        md += "\n".join("| " + " | ".join(esc(c) for c in row) + " |" for row in body)
-        inner = "\n".join(f"{row[0]}. <b>{escape(row[1])}</b> · " + " · ".join(escape(c) for c in row[2:])
-                          for row in body)
-    else:
-        md += "Nobody here yet."
+        md = f"## Top players\n\nBy {esc(label)}\n\n> Nobody here yet."
         inner = "Nobody here yet."
     html = f"<b>Top players</b>\n<b>By {escape(label)}</b>\n<blockquote>{inner}</blockquote>"
     return md, html
@@ -245,8 +235,7 @@ def board_kb(uid: int, view: str, styled: bool = True) -> InlineKeyboardMarkup:
 
 
 async def load(view: str):
-    fetch = {"nex": db.top_nex, "col": db.top_collectors, "wai": db.top_waifus}[view]
-    rows = await fetch(TOPPLAYERS_COUNT)
+    rows = await (db.top_nex(TOPPLAYERS_COUNT) if view == "nex" else db.top_collectors(TOPPLAYERS_COUNT))
     return board_view(view, rows)
 
 

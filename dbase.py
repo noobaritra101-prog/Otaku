@@ -606,12 +606,3 @@ async def top_collectors(limit: int = 10):
         "FROM collection c JOIN users u ON u.user_id = c.user_id JOIN characters ch ON ch.char_id = c.char_id "
         "GROUP BY u.user_id ORDER BY uniq DESC, copies DESC, u.user_id LIMIT ?", (limit,)) as cur:
         return await cur.fetchall()
-
-
-async def top_waifus(limit: int = 10):
-    """Characters owned by the most people (then most copies). Rows: char_id, name, anime, rarity, sub_rarity, owners, copies."""
-    async with _db.execute(
-        "SELECT ch.char_id, ch.name, ch.anime, ch.rarity, ch.sub_rarity, COUNT(*) AS owners, SUM(c.qty) AS copies "
-        "FROM collection c JOIN characters ch ON ch.char_id = c.char_id "
-        "GROUP BY ch.char_id ORDER BY owners DESC, copies DESC, ch.char_id LIMIT ?", (limit,)) as cur:
-        return await cur.fetchall()

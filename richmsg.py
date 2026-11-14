@@ -52,14 +52,18 @@ def media_ref(kind: str) -> tuple[str, str]:
     return "![](tg://video?id=lead)", "video"
 
 
-def _payload(markdown: str, media: tuple[str, str] | None, media_below: bool) -> dict[str, Any]:
+def _payload(markdown: str, media: tuple[str, str] | None, media_below: bool,
+             spoiler: bool = False) -> dict[str, Any]:
     """rich_message dict; media = (file_id, kind) becomes a media block (above the text unless media_below)."""
     rich: dict[str, Any] = {"markdown": markdown}
     if media:
         file_id, kind = media
         line, input_type = media_ref(kind)
         rich["markdown"] = f"{markdown}\n\n{line}" if media_below else f"{line}\n\n{markdown}"
-        rich["media"] = [{"id": "lead", "media": {"type": input_type, "media": file_id}}]
+        item = {"type": input_type, "media": file_id}
+        if spoiler:
+            item["has_spoiler"] = True
+        rich["media"] = [{"id": "lead", "media": item}]
     return rich
 
 
@@ -68,12 +72,13 @@ async def send_rich(bot, chat_id: int, markdown: str, *,
                     reply_markup: InlineKeyboardMarkup | None = None,
                     message_thread_id: int | None = None,
                     reply_to_message_id: int | None = None,
-                    media_below: bool = False) -> Message:
+                    media_below: bool = False,
+                    spoiler: bool = False) -> Message:
     """media = (file_id, kind) where kind is photo / video / animation.
 
     media_below=True puts the media block after the text (caption-above-media style).
     """
-    rich = _payload(markdown, media, media_below)
+    rich = _payload(markdown, media, media_below, spoiler)
     reply = (ReplyParameters(message_id=reply_to_message_id, allow_sending_without_reply=True)
              if reply_to_message_id else None)
     return await bot(SendRichMessage(chat_id=chat_id, rich_message=rich, reply_markup=reply_markup,
