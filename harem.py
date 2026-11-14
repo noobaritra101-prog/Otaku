@@ -7,6 +7,13 @@
 - 5 series per page, smart Prev / [page/pages] / Next buttons (only with 2+ pages; no Prev on page 1, no Next on the last page), footer "Page x/y", and a View Collection (inline) button. Buttons only work for the
   person who used the command.
 - Fallback: photo with an HTML caption, then plain text.
+
+Also here: /topplayers leaderboard and /settplayer (set its video / GIF / picture).
+- Rich message with the /settplayer media on top (a media block), a table of the top TOPPLAYERS_COUNT and three
+  toggle buttons: Nex (richest players), Collection (most unique characters) and Waifus (characters owned by the
+  most people). The same message is edited. Only the person who used /topplayers can press the buttons.
+- Fallbacks: rich + media, rich, HTML media caption, HTML text; each with coloured then plain buttons.
+- /settplayer (owner and co-owners): reply to a photo / video / GIF, stored as a file_id in settings.
 """
 import logging
 from collections import defaultdict
@@ -14,14 +21,19 @@ from html import escape
 
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters,
+)
 
 import dbase as db
-from configaration import RARITIES
+import richmsg
+from configaration import (
+    CO_OWNERS, CURRENCY_NAME, CURRENCY_SYMBOL, OWNER_ID, RARITIES, RICH_MESSAGES, TOPPLAYERS_COUNT,
+)
 from drop import collection_btn, edit_card, send_card_rich, sub_emoji
-from minigame import notice
+from minigame import notice, topic_id
 from richmsg import esc
-from waifu import with_styles
+from waifu import send_media, with_styles
 
 router = Router()
 log = logging.getLogger("otaku.harem")
@@ -169,3 +181,182 @@ async def harem_cb(call: CallbackQuery):
     md, html, st, card = res
     await edit_card(call, md, html, card, lambda s: keyboard(viewer, target, st, s))
     await call.answer()
+
+
+# ═════════════ /topplayers leaderboard ═════════════
+SYM = CURRENCY_SYMBOL
+VIEWS = (("nex", CURRENCY_NAME), ("col", "Collection"), ("wai", "Waifus"))
+VIEW_TITLE = dict(VIEWS)
+
+
+# ───────────── data ─────────────
+def cut(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def card_name(c) -> str:
+    return c["name"] + (f" ({sub_emoji(c['sub_rarity'])})" if c["sub_rarity"] else "")
+
+
+def name_of(r) -> str:
+    return cut((r["first_name"] or (f"@{r['username']}" if r["username"] else str(r["user_id"]))).replace("\n", " "), 20)
+
+
+async def banner() -> tuple[str, str] | None:
+    fid, kind = await db.get_setting("topplayers_file_id"), await db.get_setting("topplayers_type")
+    return (fid, kind) if fid and kind in ("photo", "video", "animation") else None
+
+
+def board_view(view: str, rows) -> tuple[str, str]:
+    """(rich markdown, html fallback)."""
+    label = VIEW_TITLE[view]
+    if view == "nex":
+        head, aligns = ("#", "Player", CURRENCY_NAME), "|---:|---|---:|"
+        body = [(str(i), name_of(r), f"{r['nex']:,} {SYM}") for i, r in enumerate(rows, 1)]
+    elif view == "wai":
+        head, aligns = ("#", "Waifu", "Rarity", "Owners"), "|---:|---|---|---:|"
+        body = [(str(i), cut(card_name(r), 24), f"{RAR_EMO.get(r['rarity'], '')} {r['rarity']}".strip(),
+                 f"{r['owners']:,}") for i, r in enumerate(rows, 1)]
+    else:
+        head, aligns = ("#", "Player", "Unique", "Copies"), "|---:|---|---:|---:|"
+        body = [(str(i), name_of(r), f"{r['uniq']:,}", f"{r['copies']:,}") for i, r in enumerate(rows, 1)]
+
+    md = f"## Top players\n\nBy {esc(label)}\n\n"
+    if body:
+        md += "| " + " | ".join(esc(h) for h in head) + " |\n" + aligns + "\n"
+        md += "\n".join("| " + " | ".join(esc(c) for c in row) + " |" for row in body)
+        inner = "\n".join(f"{row[0]}. <b>{escape(row[1])}</b> · " + " · ".join(escape(c) for c in row[2:])
+                          for row in body)
+    else:
+        md += "Nobody here yet."
+        inner = "Nobody here yet."
+    html = f"<b>Top players</b>\n<b>By {escape(label)}</b>\n<blockquote>{inner}</blockquote>"
+    return md, html
+
+
+def board_kb(uid: int, view: str, styled: bool = True) -> InlineKeyboardMarkup:
+    tabs = []
+    for key, label in VIEWS:
+        on = key == view
+        text = f"• {label}" if (on and not styled) else label
+        extra = {"style": "primary"} if (on and styled) else {}
+        tabs.append(InlineKeyboardButton(text=text, callback_data=f"tp:{uid}:{key}", **extra))
+    return InlineKeyboardMarkup(inline_keyboard=[tabs])
+
+
+async def load(view: str):
+    fetch = {"nex": db.top_nex, "col": db.top_collectors, "wai": db.top_waifus}[view]
+    rows = await fetch(TOPPLAYERS_COUNT)
+    return board_view(view, rows)
+
+
+# ───────────── sending ─────────────
+async def send_board(bot, chat_id: int, uid: int, view: str,
+                     thread: int | None = None, reply_to: int | None = None) -> None:
+    md, html = await load(view)
+    media = await banner()
+    reply = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
+    # order: rich + media, rich, HTML media caption, HTML text; each with coloured then plain buttons
+    combos = ([("rich", media), ("rich", None)] if RICH_MESSAGES else []) + [("html", media), ("html", None)]
+    combos = list(dict.fromkeys(combos))
+    for kind, bn in combos:
+        for styled in (True, False):
+            kb = board_kb(uid, view, styled)
+            try:
+                if kind == "rich":
+                    await richmsg.send_rich(bot, chat_id, md, media=bn, reply_markup=kb,
+                                            message_thread_id=thread, reply_to_message_id=reply_to)
+                elif bn:
+                    await send_media((bot, chat_id), bn[1], bn[0], html, reply_markup=kb,
+                                     message_thread_id=thread, reply_parameters=reply)
+                else:
+                    await bot.send_message(chat_id, html, reply_markup=kb,
+                                           message_thread_id=thread, reply_parameters=reply)
+                return
+            except Exception as e:
+                log.warning("/topplayers send failed (%s, media=%s, styled=%s): %s", kind, bool(bn), styled, e)
+    raise RuntimeError("all /topplayers send attempts failed")
+
+
+@router.message(Command("topplayers"))
+async def top_cmd(m: Message):
+    u = m.from_user
+    if not u:
+        return
+    try:
+        await db.upsert_user(u.id, u.username, u.first_name)
+        await send_board(m.bot, m.chat.id, u.id, "nex", topic_id(m), m.message_id)
+    except Exception:
+        log.exception("/topplayers failed")
+        await notice(m, "Something went wrong", "Try again in a moment.")
+
+
+@router.callback_query(F.data.startswith("tp:"))
+async def top_cb(call: CallbackQuery):
+    parts = (call.data or "").split(":")
+    if len(parts) != 3 or not call.message:
+        return await call.answer()
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        return await call.answer()
+    view = parts[2]
+    if view not in VIEW_TITLE:
+        return await call.answer()
+    if call.from_user.id != uid:
+        return await call.answer("Only the person who used /topplayers can use these buttons.", show_alert=True)
+
+    try:
+        md, html = await load(view)
+    except Exception:
+        log.exception("/topplayers callback database error")
+        return await call.answer("Something went wrong.", show_alert=True)
+    media = await banner()
+    msg = call.message
+    chat_id, msg_id = msg.chat.id, msg.message_id
+    for rich in ((True, False) if RICH_MESSAGES else (False,)):
+        for styled in (True, False):
+            kb = board_kb(uid, view, styled)
+            try:
+                if rich:
+                    await richmsg.edit_rich(call.bot, chat_id, msg_id, md, reply_markup=kb, media=media)
+                elif msg.text:
+                    await call.bot.edit_message_text(html, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+                else:
+                    await call.bot.edit_message_caption(chat_id=chat_id, message_id=msg_id,
+                                                        caption=html, reply_markup=kb)
+                return await call.answer()
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    return await call.answer()
+                log.debug("/topplayers edit failed (rich=%s styled=%s): %s", rich, styled, e)
+    # the message cannot be edited in place: send a fresh one and delete the old one
+    try:
+        await send_board(call.bot, chat_id, uid, view, msg.message_thread_id if msg.is_topic_message else None)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    except Exception:
+        log.exception("/topplayers resend failed")
+    await call.answer()
+
+
+# ───────────── /settplayer (owner and co-owners) ─────────────
+@router.message(Command("settplayer"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
+async def set_tplayer(m: Message):
+    """Reply to a photo / video / GIF to use it on /topplayers (stored as a file_id)."""
+    r = m.reply_to_message
+    if not r:
+        return await notice(m, "Usage", "Reply to a photo, video or GIF with /settplayer")
+    if r.video:
+        kind, fid = "video", r.video.file_id
+    elif r.animation:
+        kind, fid = "animation", r.animation.file_id
+    elif r.photo:
+        kind, fid = "photo", r.photo[-1].file_id
+    else:
+        return await notice(m, "Unsupported media", "Reply to a photo, video or GIF.")
+    await db.set_setting("topplayers_file_id", fid)
+    await db.set_setting("topplayers_type", kind)
+    await notice(m, "Top players media updated", f"Type: {kind}. Send /topplayers to preview.")

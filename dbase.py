@@ -588,3 +588,30 @@ async def shop_cleanup(keep_day: str) -> None:
     """Old days are not needed any more."""
     await _db.execute("DELETE FROM shop_offers WHERE day < ?", (keep_day,))
     await _db.commit()
+
+
+# ---------- leaderboard ----------
+async def top_nex(limit: int = 10):
+    """Richest users first (users with 0 Nex are left out)."""
+    async with _db.execute(
+        "SELECT user_id, username, first_name, nex FROM users WHERE nex > 0 "
+        "ORDER BY nex DESC, user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def top_collectors(limit: int = 10):
+    """Most unique characters first, then most copies. Rows: user_id, username, first_name, uniq, copies."""
+    async with _db.execute(
+        "SELECT u.user_id, u.username, u.first_name, COUNT(*) AS uniq, SUM(c.qty) AS copies "
+        "FROM collection c JOIN users u ON u.user_id = c.user_id JOIN characters ch ON ch.char_id = c.char_id "
+        "GROUP BY u.user_id ORDER BY uniq DESC, copies DESC, u.user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def top_waifus(limit: int = 10):
+    """Characters owned by the most people (then most copies). Rows: char_id, name, anime, rarity, sub_rarity, owners, copies."""
+    async with _db.execute(
+        "SELECT ch.char_id, ch.name, ch.anime, ch.rarity, ch.sub_rarity, COUNT(*) AS owners, SUM(c.qty) AS copies "
+        "FROM collection c JOIN characters ch ON ch.char_id = c.char_id "
+        "GROUP BY ch.char_id ORDER BY owners DESC, copies DESC, ch.char_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()

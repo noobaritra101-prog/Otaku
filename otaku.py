@@ -15,6 +15,7 @@ from aiogram.types import (
 import dbase as db
 import inspect
 
+import backup
 import drop
 import harem
 import minigame
@@ -489,8 +490,9 @@ async def rarity_cb(call: CallbackQuery):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    await db.init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await backup.restore(bot)          # load the pinned backup BEFORE the database is opened
+    await db.init_db()
     dp = Dispatcher()
     dp.message.outer_middleware(IgnoreOldMessages())
     dp.message.outer_middleware(drop.DropCounter())
@@ -500,14 +502,19 @@ async def main():
     dp.include_router(waifu.router)
     dp.include_router(drop.router)
     dp.include_router(harem.router)
+    dp.include_router(backup.router)
+    backup_task = None
     try:
         await bot.delete_webhook(drop_pending_updates=True)   # also clears old queued commands
         me = await bot.get_me()
         log.info("Started as @%s", me.username)
         if me.username and me.username.lower() != BOT_USERNAME.lower():
             log.warning("BOT_USERNAME (%s) does not match the token's bot (@%s)", BOT_USERNAME, me.username)
+        backup_task = asyncio.create_task(backup.backup_loop(bot))
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
+        if backup_task:
+            backup_task.cancel()
         await db.close_db()
 
 

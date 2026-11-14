@@ -1,4 +1,5 @@
-"""Mini games: /mines (5x5 board, one rich message edited in place) and /slot (free 🎰 spin).
+"""Mini games: /mines (5x5 board, one rich message edited in place), /slot (free 🎰 spin) and /whoami
+(guess the spoiler character).
 
 Self-contained module: otaku.py only does `import minigame` and `dp.include_router(minigame.router)`.
 Shares the Nex lock (db.nex_lock) with /ngive so balances can't race.
@@ -13,7 +14,8 @@ from dataclasses import dataclass, field
 from html import escape
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters,
@@ -28,6 +30,7 @@ from configaration import (
     MINES_ICON_HIDDEN, MINES_ICON_TILE, MINES_ICON_BOMB, MINES_ICON_BLAST,
     SLOT_MAX_SPINS, SLOT_WINDOW, SLOT_LIMIT_COOLDOWN, SLOT_REWARD_JACKPOT, SLOT_REWARD_TRIPLE, SLOT_REWARD_TWO_SEVENS,
     SLOT_REWARD_PAIR, SLOT_REWARD_NONE,
+    GUESS_COOLDOWN, GUESS_MAX_WINS, GUESS_REWARD, GUESS_SECONDS, GUESS_WINDOW,
 )
 
 router = Router()
@@ -440,3 +443,151 @@ async def slot_cmd(m: Message):
     md = f"## {esc(title)}\n\n{line}\n\n{got}"
     html = f"<b>{escape(title)}</b>\n{line}\n{got_h}"
     await rich_reply_to(m.bot, m.chat.id, dice.message_id, topic_id(m), md, html)
+
+
+# ═════════════ /whoami ═════════════
+# The bot sends a random character picture with a spoiler. Whoever types the character's name first in the chat
+# within GUESS_SECONDS wins GUESS_REWARD Nex. Wrong guesses are ignored silently (they pass on to other handlers).
+# One game per chat, GUESS_COOLDOWN between games in a chat, GUESS_MAX_WINS paid wins per user per GUESS_WINDOW.
+# Guesses are plain messages, so BotFather privacy mode must be disabled (same as drops).
+# drop.py and waifu.py import this module, so their helpers are imported inside the functions (no import cycle).
+GROUP_CHATS = {ChatType.GROUP, ChatType.SUPERGROUP}
+
+
+@dataclass
+class GuessGame:
+    chat_id: int
+    thread: int | None
+    msg_id: int
+    char: object
+    started: float = field(default_factory=time.time)
+    done: bool = False
+    task: asyncio.Task | None = None
+
+
+_guess_games: dict[int, GuessGame] = {}     # chat id -> running game
+_guess_busy: set[int] = set()               # chats where a game is being started right now
+_guess_end: dict[int, float] = {}           # chat id -> time the last game ended
+_guess_last: dict[int, int] = {}            # chat id -> last card used (no immediate repeat)
+_guess_wins: dict[int, list[float]] = {}    # user id -> [window start, paid wins]   (in memory, resets on restart)
+
+
+async def _guess_reveal(bot, g: GuessGame, title: str) -> None:
+    """Edit the game picture's caption to show the answer."""
+    from drop import name_tag
+    from waifu import rarity_label
+    c = g.char
+    caption = (f"<b>{escape(title)}</b>\n<blockquote>{escape(name_tag(c))}\n"
+               f"{escape(c['anime'])} · {rarity_label(c['rarity'])}</blockquote>")
+    try:
+        await bot.edit_message_caption(chat_id=g.chat_id, message_id=g.msg_id, caption=caption)
+    except TelegramAPIError as e:
+        log.debug("whoami reveal failed in %s: %s", g.chat_id, e)
+
+
+def _guess_close(g: GuessGame) -> None:
+    _guess_games.pop(g.chat_id, None)
+    _guess_end[g.chat_id] = time.time()
+
+
+async def _guess_timeout(bot, g: GuessGame) -> None:
+    from drop import name_tag
+    await asyncio.sleep(GUESS_SECONDS)
+    if g.done:
+        return
+    g.done = True
+    _guess_close(g)
+    await _guess_reveal(bot, g, "Time's up")
+    n = name_tag(g.char)
+    await rich_reply_to(
+        bot, g.chat_id, g.msg_id, g.thread,
+        f"## Time's up\n\nNobody guessed it. It was **{esc(n)}**.",
+        f"<b>Time's up</b>\nNobody guessed it. It was <b>{escape(n)}</b>.")
+
+
+@router.message(Command("whoami"), F.chat.type.in_(GROUP_CHATS))
+async def whoami_cmd(m: Message):
+    from drop import pick_drop
+    from waifu import send_media
+    if not m.from_user or m.from_user.is_bot:
+        return
+    cid = m.chat.id
+    if cid in _guess_games or cid in _guess_busy:
+        return await notice(m, "Who am I", "A game is already running here.")
+    wait = _guess_end.get(cid, 0) + GUESS_COOLDOWN - time.time()
+    if wait > 0:
+        return await notice(m, "Who am I", f"Next game can start in {fmt_wait(wait)}.")
+
+    _guess_busy.add(cid)
+    try:
+        c = await pick_drop(_guess_last.get(cid))
+        if not c:
+            return await notice(m, "Who am I", "No characters available yet.")
+        caption = (
+            "<b>Guess the character !</b>\n"
+            f"<blockquote>Type the name in the chat within {GUESS_SECONDS} seconds.\n"
+            f"Reward: {GUESS_REWARD} {CURRENCY_SYMBOL}</blockquote>")
+        try:
+            msg = await send_media(m, c["media_type"], c["file_id"], caption, spoiler=True)
+        except TelegramAPIError as e:
+            log.warning("whoami send failed in %s (card %s): %s", cid, c["char_id"], e)
+            return await notice(m, "Something went wrong", "Try again in a moment.")
+        g = GuessGame(chat_id=cid, thread=topic_id(m), msg_id=msg.message_id, char=c)
+        _guess_games[cid] = g
+        _guess_last[cid] = c["char_id"]
+        g.task = asyncio.create_task(_guess_timeout(m.bot, g))
+    finally:
+        _guess_busy.discard(cid)
+
+
+async def _is_guess(m: Message) -> bool:
+    """True only for a correct name while a game runs in this chat, so everything else passes through."""
+    from drop import name_matches
+    g = _guess_games.get(m.chat.id)
+    if not g or g.done or not m.from_user or m.from_user.is_bot:
+        return False
+    if not m.text or m.text.startswith("/") or len(m.text) > 80:
+        return False
+    return name_matches(m.text, g.char["name"])
+
+
+@router.message(F.chat.type.in_(GROUP_CHATS), _is_guess)
+async def whoami_win(m: Message):
+    from drop import name_tag
+    from waifu import mention
+    g = _guess_games.get(m.chat.id)
+    if not g or g.done:
+        return
+    g.done = True                                   # first correct guess wins (no await before this)
+    _guess_close(g)
+    if g.task:
+        g.task.cancel()
+    u, c = m.from_user, g.char
+    secs = max(1, int(time.time() - g.started))
+    now = time.time()
+    st = _guess_wins.get(u.id)
+    if not st or now - st[0] >= GUESS_WINDOW:
+        st = _guess_wins[u.id] = [now, 0]
+    paid = st[1] < GUESS_MAX_WINS
+    sym = CURRENCY_SYMBOL
+    try:
+        await db.upsert_user(u.id, u.username, u.first_name)
+        if paid:
+            async with db.nex_lock:
+                await db.add_nex(u.id, GUESS_REWARD)
+            st[1] += 1
+    except Exception:
+        log.exception("whoami reward failed for %s", u.id)
+        paid = False
+
+    await _guess_reveal(m.bot, g, "Guessed")
+    n = name_tag(c)
+    who_md = f"[{esc(u.first_name)}](tg://user?id={u.id})"
+    if paid:
+        got_md, got_h = f"Reward **{GUESS_REWARD}** {sym}", f"Reward <b>{GUESS_REWARD}</b> {sym}"
+    else:
+        got_md = got_h = "No reward, daily limit reached"
+    md = f"## Correct\n\n{who_md} guessed **{esc(n)}** in {secs}s\n\n{got_md}"
+    html = (f"<b>Correct</b>\n{mention(u.id, u.first_name)} guessed <b>{escape(n)}</b> "
+            f"in {secs}s\n{got_h}")
+    await rich_reply_to(m.bot, m.chat.id, m.message_id, g.thread, md, html)

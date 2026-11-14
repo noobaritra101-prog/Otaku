@@ -8,6 +8,8 @@ OWNER_ID = 5716292610
 CO_OWNERS = [5583111696, 8338154926, 7964904329, 5822885863]   # same rights as the owner in waifu.py
 
 DB_PATH = "otaku_nexus.db"
+BACKUP_GROUP = "otaku_file"        # backup group (without @): bot must be admin with Pin + Delete rights
+BACKUP_EVERY = 15 * 60             # seconds between database backups
 DROP_EVERY = 100                   # messages per drop (default; each group can change it with /setdrop)
 
 RICH_MESSAGES = True               # native rich messages (Bot API 10.1+) for /mynex, auto-fallback to HTML
