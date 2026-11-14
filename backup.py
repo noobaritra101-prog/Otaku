@@ -1,7 +1,8 @@
 """Otaku Nexus - database backup to the backup group (BACKUP_GROUP).
 
-- Every BACKUP_EVERY seconds: snapshot the database, zip it, send the zip to the group, pin it, then unpin
-  and delete the previous backup. The new file is sent and pinned FIRST, so there is never a moment without
+- Every BACKUP_EVERY seconds: snapshot the database, zip it, send the zip to the group, make it the only pinned
+  message (unpin all, then pin), then delete the previous backups (the pinned one and every earlier one this process
+  sent that is still there; anything that cannot be deleted is retried on the next cycle). The new file is sent and pinned FIRST, so there is never a moment without
   a backup.
 - On startup (before the database is opened): read the pinned message of the group, download the zip and
   restore it, but only when the backup is newer than the local database (or there is no local database).
@@ -77,30 +78,61 @@ async def _pinned(bot) -> Message | None:
 
 
 # ───────────── send + pin + clean up ─────────────
+_sent_ids: list[int] = []        # backup messages this process sent and has not deleted yet (retried every cycle)
+
+
+async def _drop_old(bot, ids: set[int]) -> None:
+    """Unpin and delete old backup messages. Whatever cannot be deleted now stays in _sent_ids for the next cycle."""
+    for mid in sorted(ids):
+        try:
+            await bot.unpin_chat_message(chat_id=CHAT, message_id=mid)
+        except TelegramAPIError as e:
+            log.debug("unpin old backup %s: %s", mid, e)      # already unpinned / gone is fine
+        try:
+            await bot.delete_message(chat_id=CHAT, message_id=mid)
+        except TelegramAPIError as e:
+            if "not found" in str(e).lower():                 # already deleted
+                if mid in _sent_ids:
+                    _sent_ids.remove(mid)
+            else:
+                log.warning("delete old backup %s failed, will retry next cycle: %s", mid, e)
+            continue
+        if mid in _sent_ids:
+            _sent_ids.remove(mid)
+
+
 async def run_backup(bot) -> tuple[bool, str]:
-    """One backup cycle. Returns (ok, text)."""
+    """One backup cycle. Returns (ok, text).
+
+    Send the new zip, make it the ONLY pinned message (unpin_all, then pin), then unpin + delete every older backup:
+    the one currently pinned (getChat can lag right after a pin, so a manual /backup straight after an automatic
+    one used to miss it) and every backup this process sent earlier that is still around."""
     if _restore_failed:
         return False, "Backup paused: the startup restore failed, fix it and restart."
     async with _lock:
         try:
             data, name = await asyncio.to_thread(_snapshot_zip)
-            prev = await _pinned(bot)
+            try:
+                prev = await _pinned(bot)
+            except TelegramAPIError as e:
+                log.warning("could not read the pinned message: %s", e)
+                prev = None
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             sent = await bot.send_document(
                 CHAT, BufferedInputFile(data, filename=name),
                 caption=f"<b>Database backup</b>\n{now} · {len(data) / 1024:.0f} KB",
                 disable_notification=True)
+            _sent_ids.append(sent.message_id)
+            try:
+                await bot.unpin_all_chat_messages(chat_id=CHAT)     # nothing old stays pinned, even a stale pin
+            except TelegramAPIError as e:
+                log.warning("unpin all failed: %s", e)
             await bot.pin_chat_message(chat_id=CHAT, message_id=sent.message_id, disable_notification=True)
+            old = {i for i in _sent_ids if i != sent.message_id}
             if _is_backup(prev) and prev.message_id != sent.message_id:
-                try:
-                    await bot.unpin_chat_message(chat_id=CHAT, message_id=prev.message_id)
-                except TelegramAPIError as e:
-                    log.warning("unpin old backup failed: %s", e)
-                try:
-                    await bot.delete_message(chat_id=CHAT, message_id=prev.message_id)
-                except TelegramAPIError as e:
-                    log.warning("delete old backup failed: %s", e)
-            log.info("backup sent (%s, %d bytes)", name, len(data))
+                old.add(prev.message_id)
+            await _drop_old(bot, old)
+            log.info("backup sent (%s, %d bytes), removed %d old", name, len(data), len(old))
             return True, f"{name} · {len(data) / 1024:.0f} KB"
         except Exception as e:
             log.exception("backup failed")

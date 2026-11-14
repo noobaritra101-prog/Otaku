@@ -447,7 +447,9 @@ async def slot_cmd(m: Message):
 
 
 # ═════════════ /whoami ═════════════
-# The bot sends a random character picture WITH A SPOILER (a normal picture message, so the spoiler is certain).
+# The bot sends a random character picture as the media block of a rich message, hidden by a spoiler (Rich HTML,
+# tg-spoiler attribute on the media tag). If that fails: Rich Markdown without the spoiler; if rich fails altogether,
+# a normal spoiler picture with an HTML caption. Which one was used is logged ("whoami game sent as ...").
 # Whoever types the character's name first in the chat within GUESS_SECONDS wins GUESS_REWARD Nex. Wrong guesses
 # are ignored silently (they pass on to other handlers). One game per chat at a time, no cooldown between games.
 # The picture message is NOT edited afterwards: the result is a separate rich reply (heading, quote, time, dividers).
@@ -509,16 +511,40 @@ async def whoami_cmd(m: Message):
         c = await pick_drop(_guess_last.get(cid))
         if not c:
             return await notice(m, "Who am I", "No characters available yet.")
+        md = (f"## Guess the character {esc('!')}\n\n---\n\n"
+              f"> Type the name in the chat.\n>\n> Time : {GUESS_SECONDS}s\n>\n"
+              f"> Reward : {esc(str(GUESS_REWARD))} {CURRENCY_SYMBOL}")
         caption = (
             f"<b>Guess the character !</b>\n{LINE}\n"
             f"<blockquote>Type the name in the chat.\n"
             f"Time : {GUESS_SECONDS}s\n"
             f"Reward : {GUESS_REWARD} {CURRENCY_SYMBOL}</blockquote>")
-        try:
-            msg = await send_media(m, c["media_type"], c["file_id"], caption, spoiler=True)
-        except TelegramAPIError as e:
-            log.warning("whoami send failed in %s (card %s): %s", cid, c["char_id"], e)
-            return await notice(m, "Something went wrong", "Try again in a moment.")
+        msg = None
+        if RICH_MESSAGES:                           # picture as a media block inside a rich message
+            kw = {"reply_to_message_id": m.message_id} if _RICH_CAN_REPLY else {}
+            media = (c["file_id"], c["media_type"])
+            html = (f"<h2>Guess the character !</h2><hr/>"
+                    f"<blockquote>Type the name in the chat.<br/>Time : {GUESS_SECONDS}s<br/>"
+                    f"Reward : {GUESS_REWARD} {CURRENCY_SYMBOL}</blockquote>")
+            attempts = (                            # 1) Rich HTML + tg-spoiler on the picture  2) Rich Markdown, no spoiler
+                ("rich html + spoiler", lambda: richmsg.send_rich_html(
+                    m.bot, cid, html, media=media, spoiler=True, message_thread_id=topic_id(m), **kw)),
+                ("rich markdown", lambda: richmsg.send_rich(
+                    m.bot, cid, md, media=media, message_thread_id=topic_id(m), **kw)),
+            )
+            for label, send in attempts:
+                try:
+                    msg = await send()
+                    log.info("whoami game sent as %s in %s", label, cid)
+                    break
+                except Exception as e:
+                    log.warning("whoami %s failed in %s: %s", label, cid, e)
+        if msg is None:                             # last resort: normal spoiler picture
+            try:
+                msg = await send_media(m, c["media_type"], c["file_id"], caption, spoiler=True)
+            except TelegramAPIError as e:
+                log.warning("whoami send failed in %s (card %s): %s", cid, c["char_id"], e)
+                return await notice(m, "Something went wrong", "Try again in a moment.")
         g = GuessGame(chat_id=cid, thread=topic_id(m), msg_id=msg.message_id, char=c, starter_id=m.from_user.id)
         _guess_games[cid] = g
         _guess_last[cid] = c["char_id"]

@@ -94,3 +94,31 @@ async def edit_rich(bot, chat_id: int, message_id: int, markdown: str, *,
     return await bot(EditRichMessageText(chat_id=chat_id, message_id=message_id,
                                          rich_message=_payload(markdown, media, media_below),
                                          reply_markup=reply_markup))
+
+
+def media_html(kind: str, spoiler: bool = False) -> str:
+    """HTML media block for the media registered as id "lead" (Rich HTML: <img>, <video>, tg-spoiler hides it)."""
+    sp = " tg-spoiler" if spoiler else ""
+    if kind == "photo":
+        return f'<figure><img src="tg://photo?id=lead"{sp}/></figure>'
+    return f'<figure><video src="tg://video?id=lead"{sp}></video></figure>'
+
+
+async def send_rich_html(bot, chat_id: int, html: str, *,
+                         media: tuple[str, str] | None = None,
+                         spoiler: bool = False,
+                         reply_markup: InlineKeyboardMarkup | None = None,
+                         message_thread_id: int | None = None,
+                         reply_to_message_id: int | None = None) -> Message:
+    """Rich message written in Rich HTML. media = (file_id, kind) is placed on top as a media block, hidden by a
+    spoiler when spoiler=True (the documented way: the tg-spoiler attribute on the media tag)."""
+    rich: dict[str, Any] = {"html": html}
+    if media:
+        file_id, kind = media
+        _, input_type = media_ref(kind)
+        rich["html"] = media_html(kind, spoiler) + html
+        rich["media"] = [{"id": "lead", "media": {"type": input_type, "media": file_id}}]
+    reply = (ReplyParameters(message_id=reply_to_message_id, allow_sending_without_reply=True)
+             if reply_to_message_id else None)
+    return await bot(SendRichMessage(chat_id=chat_id, rich_message=rich, reply_markup=reply_markup,
+                                     message_thread_id=message_thread_id, reply_parameters=reply))
