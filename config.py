@@ -21,6 +21,11 @@ DB_GROUP = os.getenv("DB_GROUP", "")           # every upload is posted here wit
 OWNER_ID = int(os.environ["OWNER_ID"])         # required
 CO_OWNERS = _ids("CO_OWNERS")                  # comma separated; same rights as the owner in waifu.py
 
+# MongoDB (the live database). The URI holds the password, so it lives in .env only.
+MONGO_URI = os.environ["MONGO_URI"]            # required, e.g. mongodb+srv://user:password@cluster0.xxx.mongodb.net/
+MONGO_DB = os.getenv("MONGO_DB", "otaku_nexus")
+
+# Old SQLite file: only used by the /restore command to copy previous data into MongoDB.
 DB_PATH = os.getenv("DB_PATH", "data/otaku_nexus.db")
 DROP_EVERY = 100                   # messages per drop (default; each group can change it with /setdrop)
 
