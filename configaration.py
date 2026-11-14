@@ -42,6 +42,16 @@ MINES_RTP = 0.97                   # payout fairness, 0.97 = 3% house edge
 MINES_TIMEOUT = 300                # idle seconds before auto cash out
 MINES_MIN_CASHOUT = 3              # safe tiles to open before cash out unlocks
 
+# Guess game (/guess) - spoiler picture, type the name in the chat
+GUESS_SECONDS = 30                 # time to guess
+GUESS_REWARD = 5                   # Nex for the first correct guess
+GUESS_COOLDOWN = 60                # seconds before the next game can start in the same group
+GUESS_MAX_WINS = 10                # paid wins per user per GUESS_WINDOW (max 50 Nex a day)
+GUESS_WINDOW = 24 * 60 * 60
+
+# Leaderboard (/topplayers)
+TOPPLAYERS_COUNT = 10             # players shown
+
 # Mines tile icons
 MINES_ICON_HIDDEN = "\u2800"       # unopened tile: blank (Braille blank, buttons can't be empty)
 MINES_ICON_TILE = "🪎"             # opened safe tile
