@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS drops (
     message_id INTEGER,
     dropped_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+
+CREATE TABLE IF NOT EXISTS whoami_stats (
+    user_id INTEGER PRIMARY KEY,
+    games   INTEGER NOT NULL DEFAULT 0,
+    best    REAL
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS whoami_wins (
+    user_id INTEGER NOT NULL,
+    day     TEXT NOT NULL,
+    wins    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+) WITHOUT ROWID;
 """
 
 
@@ -606,3 +619,108 @@ async def top_collectors(limit: int = 10):
         "FROM collection c JOIN users u ON u.user_id = c.user_id JOIN characters ch ON ch.char_id = c.char_id "
         "GROUP BY u.user_id ORDER BY uniq DESC, copies DESC, u.user_id LIMIT ?", (limit,)) as cur:
         return await cur.fetchall()
+
+
+# ---------- /whoami wins and ranks ----------
+async def whoami_win_add(user_id: int, day: str, cap: int) -> tuple[bool, int]:
+    """Count one /whoami win for the day unless the daily cap is reached. Returns (counted, wins today)."""
+    await _db.execute("INSERT OR IGNORE INTO whoami_wins (user_id, day, wins) VALUES (?,?,0)", (user_id, day))
+    cur = await _db.execute(
+        "UPDATE whoami_wins SET wins = wins + 1 WHERE user_id=? AND day=? AND wins < ?", (user_id, day, cap))
+    await _db.commit()
+    async with _db.execute("SELECT wins FROM whoami_wins WHERE user_id=? AND day=?", (user_id, day)) as c:
+        r = await c.fetchone()
+    return cur.rowcount == 1, (r[0] if r else 0)
+
+
+async def top_whoami(limit: int = 10):
+    """Most /whoami wins first. Rows: user_id, username, first_name, wins."""
+    async with _db.execute(
+        "SELECT u.user_id, u.username, u.first_name, SUM(w.wins) AS wins "
+        "FROM whoami_wins w JOIN users u ON u.user_id = w.user_id "
+        "GROUP BY u.user_id HAVING wins > 0 ORDER BY wins DESC, u.user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def rank_nex(user_id: int) -> int | None:
+    async with _db.execute("SELECT nex FROM users WHERE user_id=?", (user_id,)) as cur:
+        r = await cur.fetchone()
+    if not r or r[0] <= 0:
+        return None
+    async with _db.execute("SELECT COUNT(*) FROM users WHERE nex > ?", (r[0],)) as cur:
+        return (await cur.fetchone())[0] + 1
+
+
+async def rank_collectors(user_id: int) -> int | None:
+    async with _db.execute(
+        "SELECT COUNT(*) FROM collection c JOIN characters ch ON ch.char_id = c.char_id WHERE c.user_id=?",
+        (user_id,)) as cur:
+        mine = (await cur.fetchone())[0]
+    if not mine:
+        return None
+    async with _db.execute(
+        "SELECT COUNT(*) FROM (SELECT COUNT(*) AS n FROM collection c "
+        "JOIN characters ch ON ch.char_id = c.char_id GROUP BY c.user_id) WHERE n > ?", (mine,)) as cur:
+        return (await cur.fetchone())[0] + 1
+
+
+async def rank_whoami(user_id: int) -> int | None:
+    async with _db.execute("SELECT COALESCE(SUM(wins), 0) FROM whoami_wins WHERE user_id=?", (user_id,)) as cur:
+        mine = (await cur.fetchone())[0]
+    if not mine:
+        return None
+    async with _db.execute(
+        "SELECT COUNT(*) FROM (SELECT SUM(wins) AS n FROM whoami_wins GROUP BY user_id) WHERE n > ?",
+        (mine,)) as cur:
+        return (await cur.fetchone())[0] + 1
+
+
+async def whoami_game_add(user_id: int) -> None:
+    """One finished /whoami game for a player (the one who started it and the one who won it)."""
+    await _db.execute(
+        "INSERT INTO whoami_stats (user_id, games) VALUES (?,1) "
+        "ON CONFLICT(user_id) DO UPDATE SET games = games + 1", (user_id,))
+    await _db.commit()
+
+
+async def whoami_best(user_id: int, secs: float) -> None:
+    """Keep the player's fastest correct guess."""
+    await _db.execute(
+        "INSERT INTO whoami_stats (user_id, games, best) VALUES (?,0,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET best = CASE WHEN best IS NULL OR ? < best THEN ? ELSE best END",
+        (user_id, secs, secs, secs))
+    await _db.commit()
+
+
+async def top_games(limit: int = 10):
+    async with _db.execute(
+        "SELECT u.user_id, u.username, u.first_name, s.games FROM whoami_stats s "
+        "JOIN users u ON u.user_id = s.user_id WHERE s.games > 0 "
+        "ORDER BY s.games DESC, u.user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def top_fastest(limit: int = 10):
+    async with _db.execute(
+        "SELECT u.user_id, u.username, u.first_name, s.best FROM whoami_stats s "
+        "JOIN users u ON u.user_id = s.user_id WHERE s.best IS NOT NULL "
+        "ORDER BY s.best ASC, u.user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def rank_games(user_id: int) -> int | None:
+    async with _db.execute("SELECT games FROM whoami_stats WHERE user_id=?", (user_id,)) as cur:
+        r = await cur.fetchone()
+    if not r or r[0] <= 0:
+        return None
+    async with _db.execute("SELECT COUNT(*) FROM whoami_stats WHERE games > ?", (r[0],)) as cur:
+        return (await cur.fetchone())[0] + 1
+
+
+async def rank_fastest(user_id: int) -> int | None:
+    async with _db.execute("SELECT best FROM whoami_stats WHERE user_id=?", (user_id,)) as cur:
+        r = await cur.fetchone()
+    if not r or r[0] is None:
+        return None
+    async with _db.execute("SELECT COUNT(*) FROM whoami_stats WHERE best < ?", (r[0],)) as cur:
+        return (await cur.fetchone())[0] + 1
