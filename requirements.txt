@@ -1,4 +1,0 @@
-aiogram>=3.0
-aiosqlite
-motor>=3.3
-python-dotenv
