@@ -17,7 +17,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import dbase as db
-from config import RARITIES
+from configaration import RARITIES
 from drop import collection_btn, edit_card, send_card_rich, sub_emoji
 from minigame import notice
 from richmsg import esc

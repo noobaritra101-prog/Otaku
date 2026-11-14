@@ -21,7 +21,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 import dbase as db
 import richmsg
-from config import (
+from configaration import (
     CO_OWNERS, CURRENCY_NAME, CURRENCY_SYMBOL, OWNER_ID, DROP_ACTIVE_EVENTS, EVENT_SUBS, RARITIES, RICH_MESSAGES,
     SHOP_BANNER, SHOP_PRICES, SHOP_SLOTS, SHOP_SUNDAY_SLOTS, SHOP_UTC_OFFSET_MIN,
 )

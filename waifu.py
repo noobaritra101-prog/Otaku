@@ -16,7 +16,7 @@ from aiogram.types import (
 )
 
 import dbase as db
-from config import OWNER_ID, CO_OWNERS, DB_GROUP, RARITIES, SUB_RARITIES, SUB_RULES, RICH_MESSAGES
+from configaration import OWNER_ID, CO_OWNERS, DB_GROUP, RARITIES, SUB_RARITIES, SUB_RULES, RICH_MESSAGES
 from minigame import notice
 from richmsg import edit_rich, esc, send_rich
 
@@ -99,7 +99,7 @@ def find_sub(s: str) -> str | None | bool:
 
 
 def allowed_subs(rarity: str) -> list[str]:
-    """Sub rarity names a main rarity may carry (see SUB_RULES in config.py)."""
+    """Sub rarity names a main rarity may carry (see SUB_RULES in configaration.py)."""
     names = [n for n, *_ in SUB_RARITIES]
     rule = SUB_RULES.get(rarity)
     return names if rule is None else [n for n in names if n in rule]

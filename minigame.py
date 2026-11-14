@@ -22,7 +22,7 @@ from aiogram.types import (
 import dbase as db
 import richmsg
 from richmsg import esc
-from config import (
+from configaration import (
     RICH_MESSAGES, CURRENCY_NAME, CURRENCY_SYMBOL,
     MINES_MIN_BET, MINES_MAX_BET, MINES_DEFAULT, MINES_RTP, MINES_TIMEOUT, MINES_MIN_CASHOUT,
     MINES_ICON_HIDDEN, MINES_ICON_TILE, MINES_ICON_BOMB, MINES_ICON_BLAST,
