@@ -37,6 +37,7 @@ import logging
 import os
 import random
 import shutil
+import socket
 import sqlite3
 import tempfile
 import time
@@ -68,6 +69,8 @@ API_TIMEOUT = 25                 # small calls (get_chat, get_file, pin, delete 
                                  # fast and retried on a fresh one instead of waiting a full minute
 RETRIES = 6                      # tries for small calls
 TRANSFER_RETRIES = 3             # tries for upload / download
+KEEP_OLD = 4                     # older backups kept (unpinned) in the group as a safety net
+SHRINK_LIMIT = 0.5               # refuse to replace a pinned backup with one smaller than this fraction of it
 ALERT_AFTER = 3                  # tell the owner after this many failed cycles in a row
 
 _lock = asyncio.Lock()
@@ -171,9 +174,29 @@ def _msg_ts(msg: Message) -> int:
     return int(d.timestamp())
 
 
+async def _direct_call(token: str, method: str, **params):
+    """One Bot API call on a brand new IPv4-only connection (fallback when the shared session is stuck)."""
+    timeout = aiohttp.ClientTimeout(total=40, sock_connect=15, sock_read=30)
+    conn = aiohttp.TCPConnector(family=socket.AF_INET, force_close=True)
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
+        async with s.post(f"https://api.telegram.org/bot{token}/{method}", json=params) as r:
+            if r.status >= 500:
+                raise ConnectionError(f"Telegram answered HTTP {r.status}")
+            j = await r.json(content_type=None)
+    if not j.get("ok"):
+        raise ValueError(f"Telegram refused {method}: {j.get('description')}")
+    return j["result"]
+
+
 async def _pinned(bot) -> Message | None:
-    chat = await _retry("get_chat", lambda: bot.get_chat(CHAT, request_timeout=API_TIMEOUT), tries=5)
-    return chat.pinned_message
+    try:
+        chat = await _retry("get_chat", lambda: bot.get_chat(CHAT, request_timeout=API_TIMEOUT), tries=3)
+        return chat.pinned_message
+    except _TRANSIENT as e:
+        log.warning("get_chat through the bot session failed (%s), trying a fresh connection", str(e)[:80])
+    res = await _retry("get_chat (direct)", lambda: _direct_call(bot.token, "getChat", chat_id=CHAT), tries=3)
+    pm = res.get("pinned_message")
+    return Message.model_validate(pm) if pm else None
 
 
 # ───────────── local database helpers (blocking, used before the async db is open too) ─────────────
@@ -285,8 +308,12 @@ async def run_backup(bot, force: bool = False, manual: bool = False) -> tuple[bo
         try:
             try:
                 prev = await _pinned(bot)
-            except TelegramAPIError as e:
+            except Exception as e:
+                # Cannot see what is pinned -> never upload blindly (an empty database could replace the good backup)
                 log.warning("could not read the pinned message: %s", e)
+                if not force:
+                    raise RuntimeError("could not read the pinned backup (" + (str(e)[:80] or type(e).__name__) +
+                                       "), skipping this cycle so the good backup is never overwritten") from e
                 prev = None
             if not force and _is_backup(prev) and await asyncio.to_thread(_local_is_empty):
                 return False, "The database is empty but a backup is pinned. Not overwriting it. Restart the bot to restore, or /import."
@@ -306,6 +333,11 @@ async def run_backup(bot, force: bool = False, manual: bool = False) -> tuple[bo
             await db.set_setting("last_backup_at", str(int(ts.timestamp())))   # goes inside the snapshot
             version = await asyncio.to_thread(_data_version)                   # sampled before the snapshot
             data, name = await asyncio.to_thread(_snapshot_zip)
+            prev_size = (prev.document.file_size or 0) if _is_backup(prev) else 0
+            if not force and prev_size and len(data) < prev_size * SHRINK_LIMIT:
+                raise ValueError(f"the new backup ({len(data) / 1024:.0f} KB) is much smaller than the pinned one "
+                                 f"({prev_size / 1024:.0f} KB). Not replacing it. If the data really shrank, "
+                                 "use /import with the current .db to force it.")
             if len(data) > BOT_UPLOAD_LIMIT:
                 raise ValueError(f"backup is {len(data) / MB:.1f} MB, over Telegram's 50 MB upload limit")
             caption = f"<b>Database backup</b>\n{ts.strftime('%Y-%m-%d %H:%M:%S UTC')} · {len(data) / 1024:.0f} KB"
@@ -332,15 +364,17 @@ async def run_backup(bot, force: bool = False, manual: bool = False) -> tuple[bo
                     pass
                 raise
             _sent_ids.append(sent.message_id)
-            old = {i for i in _sent_ids if i != sent.message_id}
-            if _is_backup(prev) and prev.message_id != sent.message_id:
-                old.add(prev.message_id)
+            if _is_backup(prev) and prev.message_id != sent.message_id and prev.message_id not in _sent_ids:
+                _sent_ids.insert(0, prev.message_id)
+            older = [i for i in _sent_ids if i != sent.message_id]            # oldest first
+            old = set(older[:-KEEP_OLD]) if len(older) > KEEP_OLD else set()   # keep the newest KEEP_OLD
             problems = await _drop_old(bot, old)
             await _save_ids()
 
             S.update(last_ok=time.time(), last_size=len(data), last_name=name, last_error="", fails=0,
                      last_version=version)
-            log.info("backup sent (%s, %d bytes), removed %d old", name, len(data), len(old) - len(problems))
+            log.info("backup sent (%s, %d bytes), removed %d old, kept %d", name, len(data), len(old) - len(problems),
+                     len([i for i in _sent_ids if i != sent.message_id]))
             text = f"{name} · {len(data) / 1024:.0f} KB"
             if problems:
                 text += ". Old backups left: " + "; ".join(problems[:2]) + ". Give the bot the Delete messages right."
@@ -396,24 +430,64 @@ async def backup_loop(bot) -> None:
 
 
 # ───────────── download ─────────────
+async def _direct_download(token: str, file_id: str, size: int, dest: str) -> None:
+    """Fallback download that does NOT use the bot's shared HTTP session: a brand new IPv4-only connection for
+    getFile and for the file itself. Gets around a dead / stale pooled connection and IPv6 black holes."""
+    timeout = aiohttp.ClientTimeout(total=_transfer_timeout(size) + 30, sock_connect=15, sock_read=90)
+    conn = aiohttp.TCPConnector(family=socket.AF_INET, force_close=True)
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
+        async with s.get(f"https://api.telegram.org/bot{token}/getFile", params={"file_id": file_id}) as r:
+            if r.status >= 500:
+                raise ConnectionError(f"Telegram answered HTTP {r.status}")
+            j = await r.json(content_type=None)
+        if not j.get("ok"):
+            raise ValueError(f"Telegram refused getFile: {j.get('description')}")
+        path = j["result"]["file_path"]
+        async with s.get(f"https://api.telegram.org/file/bot{token}/{path}") as r:
+            if r.status != 200:
+                raise ConnectionError(f"file download answered HTTP {r.status}")
+            with open(dest, "wb") as f:
+                async for chunk in r.content.iter_chunked(256 * 1024):
+                    f.write(chunk)
+
+
 async def _download(bot, doc) -> bytes:
-    """Download a Telegram file to a temp file with long timeouts and retries, verify its size, return the bytes."""
+    """Download a Telegram file with long timeouts. Odd tries use the bot's own session, even tries a fresh
+    direct connection, so one broken connection cannot fail the restore. Returns the bytes (size verified)."""
     size = doc.file_size or 0
     if size > BOT_DOWNLOAD_LIMIT:
         raise ValueError(f"the file is {size / MB:.1f} MB, Telegram does not let bots download more than 20 MB")
-    tg = await _retry("get_file", lambda: bot.get_file(doc.file_id, request_timeout=API_TIMEOUT))
     fd, tmp = tempfile.mkstemp(suffix=".dl")
     os.close(fd)
+    tries = 8
+    last: BaseException | None = None
     try:
-        async def one() -> None:
-            await bot.download_file(tg.file_path, destination=tmp, timeout=_transfer_timeout(size),
-                                    chunk_size=256 * 1024)
-            got = os.path.getsize(tmp)
-            if size and got != size:
-                raise ConnectionError(f"incomplete download {got}/{size} bytes")
-        await _retry("download", one, tries=TRANSFER_RETRIES, base=5.0)
-        with open(tmp, "rb") as f:
-            return f.read()
+        for attempt in range(1, tries + 1):
+            direct = attempt % 2 == 0
+            try:
+                if direct:
+                    await _direct_download(bot.token, doc.file_id, size, tmp)
+                else:
+                    tg = await bot.get_file(doc.file_id, request_timeout=API_TIMEOUT)
+                    await bot.download_file(tg.file_path, destination=tmp, timeout=_transfer_timeout(size),
+                                            chunk_size=256 * 1024)
+                got = os.path.getsize(tmp)
+                if size and got != size:
+                    raise ConnectionError(f"incomplete download {got}/{size} bytes")
+                with open(tmp, "rb") as f:
+                    return f.read()
+            except TelegramRetryAfter as e:
+                last = e
+                wait = float(e.retry_after) + 1
+            except _TRANSIENT as e:
+                last = e
+                wait = min(30.0, 4.0 * attempt) * random.uniform(0.8, 1.2)
+            log.warning("download via %s failed: %s (try %d/%d), retry in %.0fs",
+                        "direct connection" if direct else "bot session",
+                        (str(last)[:100] or type(last).__name__), attempt, tries, wait)
+            if attempt < tries:
+                await asyncio.sleep(wait)
+        raise last if last else RuntimeError("download failed")
     finally:
         try:
             os.remove(tmp)
@@ -581,7 +655,7 @@ async def restore(bot) -> None:
     except Exception as e:
         _restore_failed = True
         transient = _is_transient(e)
-        err = str(e)[:200] or type(e).__name__
+        err = f"{type(e).__name__}: {str(e)[:180]}" if str(e) else type(e).__name__
         S.update(restore_state="retrying" if transient else "failed", restore_error=err)
         log.exception("restore failed, backups paused so the good backup is not overwritten")
         if transient:
