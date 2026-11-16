@@ -6,7 +6,9 @@
   a backup.
 - On startup (before the database is opened): read the pinned message of the group, download the zip and
   restore it, but only when the backup is newer than the local database (or there is no local database).
-- Nothing is kept in memory between runs: the "previous backup" is always read from the group's pin.
+- Startup restore compares the last_backup_at marker stored inside the local database with the backup's time
+  (not file times); an empty local database always restores. Message ids of sent backups are saved in the
+  database so old files are still deleted after a restart. An empty database never overwrites a pinned backup.
 - The bot must be admin in the backup group with the Pin messages and Delete messages rights.
 - Telegram limits: bots can download files up to 20 MB and upload up to 50 MB.
 - /import (owner and co-owners): send an old .db (or a backup .zip) as a file with /import as the caption, or
@@ -77,12 +79,56 @@ async def _pinned(bot) -> Message | None:
     return (await bot.get_chat(CHAT)).pinned_message
 
 
+# ───────────── local database helpers (blocking, used before the async db is open too) ─────────────
+def _local_get(key: str) -> str | None:
+    """Read one value from the settings table of the local database file, None when unavailable."""
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        try:
+            r = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        finally:
+            con.close()
+        return r[0] if r else None
+    except sqlite3.Error:
+        return None
+
+
+def _local_is_empty() -> bool:
+    """True when the local database has no users and no characters (a fresh, empty file)."""
+    if not os.path.exists(DB_PATH):
+        return True
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        try:
+            u = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            c = con.execute("SELECT COUNT(*) FROM characters").fetchone()[0]
+        finally:
+            con.close()
+        return (u + c) == 0
+    except sqlite3.Error:
+        return True
+
+
+def _ids_of(raw: str | None) -> list[int]:
+    return [int(x) for x in (raw or "").split(",") if x.strip().isdigit()]
+
+
 # ───────────── send + pin + clean up ─────────────
-_sent_ids: list[int] = []        # backup messages this process sent and has not deleted yet (retried every cycle)
+_sent_ids: list[int] = []        # backup messages sent and not deleted yet (also saved in the database)
 
 
-async def _drop_old(bot, ids: set[int]) -> None:
-    """Unpin and delete old backup messages. Whatever cannot be deleted now stays in _sent_ids for the next cycle."""
+async def _save_ids() -> None:
+    try:
+        await db.set_setting("backup_msg_ids", ",".join(str(i) for i in _sent_ids[-30:]))
+    except Exception:
+        log.exception("could not save the backup message ids")
+
+
+async def _drop_old(bot, ids: set[int]) -> list[str]:
+    """Unpin and delete old backup messages. Returns problems; whatever cannot be deleted stays in _sent_ids."""
+    problems: list[str] = []
     for mid in sorted(ids):
         try:
             await bot.unpin_chat_message(chat_id=CHAT, message_id=mid)
@@ -96,47 +142,74 @@ async def _drop_old(bot, ids: set[int]) -> None:
                     _sent_ids.remove(mid)
             else:
                 log.warning("delete old backup %s failed, will retry next cycle: %s", mid, e)
+                problems.append(f"could not delete {mid}: {str(e)[:80]}")
             continue
         if mid in _sent_ids:
             _sent_ids.remove(mid)
+    return problems
 
 
-async def run_backup(bot) -> tuple[bool, str]:
+async def run_backup(bot, force: bool = False) -> tuple[bool, str]:
     """One backup cycle. Returns (ok, text).
 
     Send the new zip, make it the ONLY pinned message (unpin_all, then pin), then unpin + delete every older backup:
-    the one currently pinned (getChat can lag right after a pin, so a manual /backup straight after an automatic
-    one used to miss it) and every backup this process sent earlier that is still around."""
+    the pinned one, every id saved in the database (survives restarts) and every one sent by this process.
+    A backup of an EMPTY database is refused while a backup is pinned (force=True skips that check)."""
     if _restore_failed:
         return False, "Backup paused: the startup restore failed, fix it and restart."
     async with _lock:
+        sent = None
         try:
-            data, name = await asyncio.to_thread(_snapshot_zip)
             try:
                 prev = await _pinned(bot)
             except TelegramAPIError as e:
                 log.warning("could not read the pinned message: %s", e)
                 prev = None
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if not force and _is_backup(prev) and await asyncio.to_thread(_local_is_empty):
+                return False, "The database is empty but a backup is pinned. Not overwriting it. Restart the bot to restore, or /import."
+            for i in _ids_of(await db.get_setting("backup_msg_ids")):
+                if i not in _sent_ids:
+                    _sent_ids.append(i)
+            ts = datetime.now(timezone.utc)
+            await db.set_setting("last_backup_at", str(int(ts.timestamp())))   # goes inside the snapshot
+            data, name = await asyncio.to_thread(_snapshot_zip)
             sent = await bot.send_document(
                 CHAT, BufferedInputFile(data, filename=name),
-                caption=f"<b>Database backup</b>\n{now} · {len(data) / 1024:.0f} KB",
+                caption=f"<b>Database backup</b>\n{ts.strftime('%Y-%m-%d %H:%M:%S UTC')} · {len(data) / 1024:.0f} KB",
                 disable_notification=True)
-            _sent_ids.append(sent.message_id)
             try:
                 await bot.unpin_all_chat_messages(chat_id=CHAT)     # nothing old stays pinned, even a stale pin
             except TelegramAPIError as e:
                 log.warning("unpin all failed: %s", e)
-            await bot.pin_chat_message(chat_id=CHAT, message_id=sent.message_id, disable_notification=True)
+            try:
+                await bot.pin_chat_message(chat_id=CHAT, message_id=sent.message_id, disable_notification=True)
+            except Exception:
+                # unpinned new backups would never be found at startup: remove it, keep the old pin
+                try:
+                    await bot.delete_message(chat_id=CHAT, message_id=sent.message_id)
+                except TelegramAPIError:
+                    pass
+                raise
+            _sent_ids.append(sent.message_id)
             old = {i for i in _sent_ids if i != sent.message_id}
             if _is_backup(prev) and prev.message_id != sent.message_id:
                 old.add(prev.message_id)
-            await _drop_old(bot, old)
-            log.info("backup sent (%s, %d bytes), removed %d old", name, len(data), len(old))
-            return True, f"{name} · {len(data) / 1024:.0f} KB"
+            problems = await _drop_old(bot, old)
+            await _save_ids()
+            log.info("backup sent (%s, %d bytes), removed %d old", name, len(data), len(old) - len(problems))
+            text = f"{name} · {len(data) / 1024:.0f} KB"
+            if problems:
+                text += ". Old backups left: " + "; ".join(problems[:2]) + ". Give the bot the Delete messages right."
+            return True, text
         except Exception as e:
             log.exception("backup failed")
-            return False, str(e)[:200]
+            hint = ""
+            low = str(e).lower()
+            if "not enough rights" in low or "administrator" in low or "pin" in low:
+                hint = " Make the bot admin in the backup group with Pin and Delete messages rights."
+            elif "chat not found" in low:
+                hint = " The bot is not in the backup group."
+            return False, (str(e)[:160] + hint)
 
 
 async def backup_loop(bot) -> None:
@@ -147,11 +220,6 @@ async def backup_loop(bot) -> None:
 
 
 # ───────────── restore on startup ─────────────
-def _local_mtime() -> float:
-    times = [os.path.getmtime(p) for p in (DB_PATH, DB_PATH + "-wal") if os.path.exists(p)]
-    return max(times) if times else 0.0
-
-
 def _write_db(zip_bytes: bytes) -> None:
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         names = [n for n in z.namelist() if n.endswith(".db")]
@@ -163,6 +231,11 @@ def _write_db(zip_bytes: bytes) -> None:
     tmp = DB_PATH + ".restore"
     with open(tmp, "wb") as f:
         f.write(raw)
+    if os.path.exists(DB_PATH):                  # keep whatever was there, just in case
+        try:
+            shutil.copy2(DB_PATH, DB_PATH + ".bak")
+        except OSError:
+            pass
     for ext in ("-wal", "-shm"):                 # stale WAL files would corrupt the restored copy
         try:
             os.remove(DB_PATH + ext)
@@ -171,33 +244,67 @@ def _write_db(zip_bytes: bytes) -> None:
     os.replace(tmp, DB_PATH)
 
 
-async def restore(bot) -> None:
-    """Call BEFORE db.init_db(). Restores the pinned backup when it is newer than the local database."""
-    global _restore_failed
+async def _tell_owner(bot, text: str) -> None:
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except TelegramAPIError as e:
+        log.warning("could not message the owner: %s", e)
+
+
+async def _find_backup(bot) -> Message | None:
+    """The newest backup message: the pinned one, else the last ids saved in the local database (forwarded to
+    the owner to read their file id, the forward is deleted again)."""
     try:
         pin = await _pinned(bot)
-        if not _is_backup(pin):
-            log.info("restore: no backup pinned in %s, starting with the local database", CHAT)
-            if not os.path.exists(DB_PATH):
-                try:
-                    await bot.send_message(
-                        OWNER_ID, "<b>No backup found</b>\n<blockquote>No pinned backup in "
-                        f"{CHAT} and no local database. Send your old .db file with /import as the caption "
-                        "to load it.</blockquote>")
-                except TelegramAPIError as e:
-                    log.warning("could not tell the owner that no backup was found: %s", e)
+        if _is_backup(pin):
+            return pin
+    except TelegramAPIError as e:
+        log.warning("restore: could not read the pinned message: %s", e)
+    for mid in reversed(_ids_of(await asyncio.to_thread(_local_get, "backup_msg_ids"))):
+        try:
+            fwd = await bot.forward_message(chat_id=OWNER_ID, from_chat_id=CHAT, message_id=mid)
+        except TelegramAPIError:
+            continue
+        try:
+            await bot.delete_message(chat_id=OWNER_ID, message_id=fwd.message_id)
+        except TelegramAPIError:
+            pass
+        if _is_backup(fwd):
+            return fwd
+    return None
+
+
+async def restore(bot) -> None:
+    """Call BEFORE db.init_db(). Loads the newest backup from the group unless the local database is already
+    at least as new (decided by the last_backup_at marker stored INSIDE the database, not by file times)."""
+    global _restore_failed
+    try:
+        msg = await _find_backup(bot)
+        if not msg:
+            log.info("restore: no backup found in %s, starting with the local database", CHAT)
+            if _local_is_empty():
+                await _tell_owner(
+                    bot, "<b>No backup found</b>\n<blockquote>No pinned backup in "
+                    f"{CHAT} and the database is empty. Send your old .db file with /import as the caption "
+                    "to load it.</blockquote>")
             return
-        remote = pin.date.timestamp()
-        if os.path.exists(DB_PATH) and _local_mtime() >= remote:
-            log.info("restore: local database is newer than the pinned backup, keeping it")
+        remote_ts = int(msg.forward_date.timestamp()) if msg.forward_date else int(msg.date.timestamp())
+        local_ts = int(_local_get("last_backup_at") or 0)
+        if not _local_is_empty() and local_ts >= remote_ts - 120:
+            log.info("restore: local database (marker %s) is as new as the backup (%s), keeping it", local_ts, remote_ts)
             return
         buf = io.BytesIO()
-        await bot.download(pin.document.file_id, destination=buf)
+        await bot.download(msg.document.file_id, destination=buf)
         await asyncio.to_thread(_write_db, buf.getvalue())
-        log.info("restore: loaded %s (%d bytes)", pin.document.file_name, len(buf.getvalue()))
-    except Exception:
+        log.info("restore: loaded %s (%d bytes)", msg.document.file_name, len(buf.getvalue()))
+        await _tell_owner(bot, f"<b>Backup restored</b>\n<blockquote>{escape(msg.document.file_name or '')} "
+                               f"({len(buf.getvalue()) / 1024:.0f} KB) was loaded at startup.</blockquote>")
+    except Exception as e:
         _restore_failed = True
         log.exception("restore failed, backups paused so the good backup is not overwritten")
+        await _tell_owner(bot, "<b>Restore failed</b>\n<blockquote>" + escape(str(e)[:200]) +
+                          "\nBackups are paused so the good backup is not overwritten. Fix it and restart, "
+                          "or use /import.</blockquote>")
 
 
 # ───────────── /backup (owner and co-owners): back up now ─────────────
@@ -301,7 +408,7 @@ async def import_db(bot, doc) -> tuple[bool, str]:
                 log.exception("could not reopen the previous database")
             return False, f"Conversion failed, the previous database was put back. {str(e)[:150]}"
         _restore_failed = False
-    await run_backup(bot)                             # new backup + pin right away
+    await run_backup(bot, force=True)                 # new backup + pin right away
     return True, f"{users} users, {chats} groups, {chars} characters. Backup sent and pinned."
 
 

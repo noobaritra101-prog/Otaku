@@ -359,21 +359,18 @@ async def can_control(bot, chat_id: int, user_id: int) -> bool:
 
 def panel_text(st: ChatState) -> str:
     """HTML fallback of the panel."""
-    left = max(0, st.every - st.count)
     status = "" if st.enabled else "Status: Off\n"
     return (
         "<b>Drop settings</b>\n"
-        f"<blockquote>{status}Every: {st.every} messages\n"
-        f"Next drop in: {left} messages</blockquote>\n"
+        f"<blockquote>{status}Every: {st.every} messages</blockquote>\n"
         f"Range {DROP_MIN_EVERY} to {DROP_MAX_EVERY}, step {DROP_STEP}"
     )
 
 
 def panel_md(st: ChatState) -> str:
     """Rich message panel: heading, divider, quote, range footer."""
-    left = max(0, st.every - st.count)
     lines = [] if st.enabled else ["> Status : Off", ">"]
-    lines += [f"> Every : {st.every} messages", ">", f"> Next drop in : {left} messages"]
+    lines += [f"> Every : {st.every} messages"]
     return ("## Drop settings\n\n---\n\n" + "\n".join(lines)
             + f"\n\n###### Range {DROP_MIN_EVERY} to {DROP_MAX_EVERY}, step {DROP_STEP}")
 
