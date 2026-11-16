@@ -64,8 +64,9 @@ PREFIX = "otaku_backup_"
 MB = 1024 * 1024
 BOT_DOWNLOAD_LIMIT = 20 * MB
 BOT_UPLOAD_LIMIT = 50 * MB
-API_TIMEOUT = 60                 # small calls (get_chat, pin, delete ...) in seconds
-RETRIES = 4                      # tries for small calls
+API_TIMEOUT = 25                 # small calls (get_chat, get_file, pin, delete ...): a hung connection is dropped
+                                 # fast and retried on a fresh one instead of waiting a full minute
+RETRIES = 6                      # tries for small calls
 TRANSFER_RETRIES = 3             # tries for upload / download
 ALERT_AFTER = 3                  # tell the owner after this many failed cycles in a row
 
@@ -107,7 +108,7 @@ async def _retry(label: str, factory: Callable[[], Awaitable[T]], tries: int = R
         except _TRANSIENT as e:
             if attempt == tries:
                 raise
-            wait = min(60.0, base * 2 ** (attempt - 1)) * random.uniform(0.8, 1.2)
+            wait = min(30.0, base * 2 ** (attempt - 1)) * random.uniform(0.8, 1.2)
             log.warning("%s: %s (try %d/%d), retry in %.0fs", label, str(e)[:100] or type(e).__name__,
                         attempt, tries, wait)
         await asyncio.sleep(wait)
@@ -171,7 +172,7 @@ def _msg_ts(msg: Message) -> int:
 
 
 async def _pinned(bot) -> Message | None:
-    chat = await _retry("get_chat", lambda: bot.get_chat(CHAT, request_timeout=API_TIMEOUT), tries=3)
+    chat = await _retry("get_chat", lambda: bot.get_chat(CHAT, request_timeout=API_TIMEOUT), tries=5)
     return chat.pinned_message
 
 
