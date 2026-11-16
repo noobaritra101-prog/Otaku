@@ -5,7 +5,7 @@ Drops
 - Drop message: spoiler card with a random in-character quote (DROP_QUOTES) and the bind command, plain HTML.
 - /bind <name>: first correct name wins the card. The result is a rich message (HTML fallback) with a
   View Collection button.
-- /setdrop: group admins change the interval or switch drops on / off.
+- /setdrop: group admins change the interval with a rich panel: [minus] [number] [plus] (range and step in config).
 - /dropnow: owner / co-owners, forces a drop (testing).
 
 Collection actions
@@ -46,7 +46,7 @@ import richmsg
 import waifu
 from configaration import (
     BIG_RARITIES, CURRENCY_SYMBOL, DROP_ACTIVE_EVENTS, DROP_DUP_NEX, DROP_MAX_EVERY,
-    DROP_MIN_EVERY, DROP_MSG_GAP, DROP_PRESETS, DROP_QUOTES, EVENT_SUBS, RARITIES, RICH_MESSAGES,
+    DROP_MIN_EVERY, DROP_MSG_GAP, DROP_QUOTES, DROP_STEP, EVENT_SUBS, RARITIES, RICH_MESSAGES,
     SUB_RARITIES,
 )
 from minigame import notice, topic_id
@@ -82,7 +82,7 @@ async def state_of(chat) -> ChatState:
         return st
     await db.upsert_chat(chat.id, chat.title)
     row = await db.get_chat(chat.id)
-    st = ChatState(every=row["drop_every"], enabled=bool(row["drop_enabled"]), count=row["msg_count"])
+    st = ChatState(every=min(max(row["drop_every"], DROP_MIN_EVERY), DROP_MAX_EVERY), enabled=bool(row["drop_enabled"]), count=row["msg_count"])
     st.saved = st.count
     return _states.setdefault(chat.id, st)
 
@@ -358,24 +358,34 @@ async def can_control(bot, chat_id: int, user_id: int) -> bool:
 
 
 def panel_text(st: ChatState) -> str:
+    """HTML fallback of the panel."""
     left = max(0, st.every - st.count)
+    status = "" if st.enabled else "Status: Off\n"
     return (
         "<b>Drop settings</b>\n"
-        f"<blockquote>Status: {'On' if st.enabled else 'Off'}\n"
-        f"Every: {st.every} messages\n"
-        f"Next drop in: {left} messages</blockquote>"
+        f"<blockquote>{status}Every: {st.every} messages\n"
+        f"Next drop in: {left} messages</blockquote>\n"
+        f"Range {DROP_MIN_EVERY} to {DROP_MAX_EVERY}, step {DROP_STEP}"
     )
 
 
+def panel_md(st: ChatState) -> str:
+    """Rich message panel: heading, divider, quote, range footer."""
+    left = max(0, st.every - st.count)
+    lines = [] if st.enabled else ["> Status : Off", ">"]
+    lines += [f"> Every : {st.every} messages", ">", f"> Next drop in : {left} messages"]
+    return ("## Drop settings\n\n---\n\n" + "\n".join(lines)
+            + f"\n\n###### Range {DROP_MIN_EVERY} to {DROP_MAX_EVERY}, step {DROP_STEP}")
+
+
 def panel_kb(st: ChatState, styled: bool = True) -> InlineKeyboardMarkup:
+    """One row: [minus] [current number] [plus]."""
     def b(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
         extra = {"style": style} if styled and style else {}
         return InlineKeyboardButton(text=text, callback_data=data, **extra)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [b("Drops: On" if st.enabled else "Drops: Off", "sd:t", "success" if st.enabled else "danger")],
-        [b(str(n), f"sd:i:{n}", "primary" if n == st.every else None) for n in DROP_PRESETS],
-        [b("Close", "sd:x")],
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        b("➖", "sd:-", "danger"), b(str(st.every), "sd:n"), b("➕", "sd:+", "success"),
+    ]])
 
 
 async def _apply(chat_id: int, st: ChatState, every: int | None = None, enabled: bool | None = None) -> None:
@@ -384,6 +394,39 @@ async def _apply(chat_id: int, st: ChatState, every: int | None = None, enabled:
         st.every = every
     if enabled is not None:
         st.enabled = enabled
+
+
+async def _send_panel(m: Message, st: ChatState) -> None:
+    """Rich panel as a reply, HTML fallback; coloured buttons first, plain if Telegram rejects them."""
+    for rich in ((True, False) if RICH_MESSAGES else (False,)):
+        for styled in (True, False):
+            kb = panel_kb(st, styled)
+            try:
+                if rich:
+                    await richmsg.send_rich(m.bot, m.chat.id, panel_md(st), reply_markup=kb,
+                                            message_thread_id=topic_id(m), reply_to_message_id=m.message_id)
+                else:
+                    await m.reply(panel_text(st), reply_markup=kb)
+                return
+            except Exception as e:
+                log.warning("/setdrop panel failed (rich=%s styled=%s): %s", rich, styled, e)
+
+
+async def _edit_panel(call: CallbackQuery, st: ChatState) -> None:
+    msg = call.message
+    for rich in ((True, False) if RICH_MESSAGES else (False,)):
+        for styled in (True, False):
+            kb = panel_kb(st, styled)
+            try:
+                if rich:
+                    await richmsg.edit_rich(call.bot, msg.chat.id, msg.message_id, panel_md(st), reply_markup=kb)
+                else:
+                    await msg.edit_text(panel_text(st), reply_markup=kb)
+                return
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    return
+                log.debug("/setdrop panel edit failed (rich=%s styled=%s): %s", rich, styled, e)
 
 
 @router.message(Command("setdrop"), F.chat.type.in_(GROUPS))
@@ -395,7 +438,7 @@ async def setdrop_cmd(m: Message, command: CommandObject):
     st = await state_of(m.chat)
     arg = (command.args or "").strip().lower()
     if not arg:
-        await with_styles(lambda s: m.reply(panel_text(st), reply_markup=panel_kb(st, s)))
+        await _send_panel(m, st)
     elif arg in ("on", "off"):
         await _apply(m.chat.id, st, enabled=arg == "on")
         await notice(m, "Drop settings", f"Drops are now {arg}.")
@@ -407,7 +450,7 @@ async def setdrop_cmd(m: Message, command: CommandObject):
         await _apply(m.chat.id, st, every=n)
         await notice(m, "Drop settings", f"A character will drop every {n} messages.")
     else:
-        await notice(m, "Drop settings", "Use /setdrop, /setdrop 150, /setdrop on or /setdrop off.")
+        await notice(m, "Drop settings", f"Use /setdrop or /setdrop {DROP_MIN_EVERY}-{DROP_MAX_EVERY}.")
 
 
 @router.callback_query(F.data.startswith("sd:"))
@@ -418,25 +461,16 @@ async def setdrop_cb(call: CallbackQuery):
     if not await can_control(call.bot, chat.id, call.from_user.id):
         return await call.answer("Group admins only.", show_alert=True)
     st = await state_of(chat)
-    parts = call.data.split(":")
-    action = parts[1] if len(parts) > 1 else ""
-    if action == "x":
-        try:
-            await call.message.delete()
-        except TelegramAPIError:
-            pass
+    action = call.data.split(":")[1] if ":" in call.data else ""
+    if action in ("-", "+"):
+        new = min(max(st.every + (DROP_STEP if action == "+" else -DROP_STEP), DROP_MIN_EVERY), DROP_MAX_EVERY)
+        if new == st.every:
+            return await call.answer("Maximum reached." if action == "+" else "Minimum reached.")
+        await _apply(chat.id, st, every=new)
+        await _edit_panel(call, st)
         return await call.answer()
-    if action == "t":
-        await _apply(chat.id, st, enabled=not st.enabled)
-    elif action == "i" and len(parts) > 2 and parts[2].isdigit():
-        n = int(parts[2])
-        if DROP_MIN_EVERY <= n <= DROP_MAX_EVERY:
-            await _apply(chat.id, st, every=n)
-    try:
-        await with_styles(lambda s: call.message.edit_text(panel_text(st), reply_markup=panel_kb(st, s)))
-    except TelegramBadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
+    if action == "n":
+        return await call.answer(f"A character drops every {st.every} messages.")
     await call.answer()
 
 
@@ -693,6 +727,99 @@ async def gift_cb(call: CallbackQuery):
         f"{mention_md(uid, call.from_user.first_name)} gifted **{esc(card_line(c))}** to {mention_md(tid, to_name)}",
         f"{mention(uid, call.from_user.first_name)} gifted {escape(card_line(c))} to {mention(tid, to_name)}")
     await call.answer()
+
+
+# ───────────── /exo: swap one waifu for another ─────────────
+# /exo <your waifu id> <their waifu id>, as a reply to the other player. The other player accepts or declines; the swap
+# is atomic (dbase.swap_characters) and ownership is checked again when they accept.
+def exo_kb(aid: int, bid: int, ca: int, cb: int, styled: bool = True) -> InlineKeyboardMarkup:
+    def b(text, act, style):
+        return InlineKeyboardButton(text=text, callback_data=f"ex:{act}:{aid}:{bid}:{ca}:{cb}",
+                                    **({"style": style} if styled else {}))
+    return InlineKeyboardMarkup(inline_keyboard=[[b("Accept", "y", "success"), b("Decline", "n", "danger")]])
+
+
+@router.message(Command("exo"))
+async def exo_cmd(m: Message, command: CommandObject):
+    u = m.from_user
+    if not u:
+        return
+    r = m.reply_to_message
+    args = (command.args or "").split()
+    usage = "Reply to a player with /exo your_id their_id. Example: /exo 12 34"
+    if not r or not r.from_user or r.forum_topic_created or len(args) != 2 \
+            or not all(a.isascii() and a.isdigit() for a in args):
+        return await notice(m, "Exchange", usage)
+    t = r.from_user
+    if t.is_bot:
+        return await notice(m, "Exchange", "You can't exchange with a bot.")
+    if t.id == u.id:
+        return await notice(m, "Exchange", "You can't exchange with yourself.")
+    ca, cb = int(args[0]), int(args[1])
+    if ca == cb:
+        return await notice(m, "Exchange", "Both IDs are the same character.")
+    try:
+        await db.upsert_user(u.id, u.username, u.first_name)
+        await db.upsert_user(t.id, t.username, t.first_name)
+        a, b = await db.get_character(ca), await db.get_character(cb)
+        if not a or not await db.owned_qty(u.id, ca):
+            return await notice(m, "Exchange", f"You don't own a character with ID {ca}.")
+        if not b or not await db.owned_qty(t.id, cb):
+            return await notice(m, "Exchange", f"{t.first_name} doesn't own a character with ID {cb}.")
+    except Exception:
+        log.exception("/exo database error")
+        return await notice(m, "Something went wrong", "Try again in a moment.")
+    md = (f"## Waifu exchange\n\n---\n\n"
+          f"{mention_md(u.id, u.first_name)} offers\n\n**{esc(card_line(a))}**\n\nID {ca}\n\n"
+          f"for {mention_md(t.id, t.first_name)}'s\n\n**{esc(card_line(b))}**\n\nID {cb}\n\n---\n\n"
+          f"###### {esc(t.first_name)}, do you accept?")
+    html = (f"<b>Waifu exchange</b>\n──────────\n"
+            f"{mention(u.id, u.first_name)} offers\n<b>{escape(card_line(a))}</b>\nID {ca}\n\n"
+            f"for {mention(t.id, t.first_name)}'s\n<b>{escape(card_line(b))}</b>\nID {cb}\n──────────\n"
+            f"{escape(t.first_name)}, do you accept?")
+    try:
+        await send_card_rich(m, md, html, a, lambda s: exo_kb(u.id, t.id, ca, cb, s))
+    except Exception as e:
+        log.warning("/exo picture failed (card %s): %s", ca, e)
+        await m.reply(html, reply_markup=exo_kb(u.id, t.id, ca, cb, False))
+
+
+@router.callback_query(F.data.startswith("ex:"))
+async def exo_cb(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) != 6 or not call.message:
+        return await call.answer()
+    try:
+        act, aid, bid, ca, cb = parts[1], int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
+    except ValueError:
+        return await call.answer()
+    me = call.from_user.id
+    a = await db.get_character(ca)
+    if act == "n":                                   # the other player declines, or the sender cancels
+        if me not in (aid, bid):
+            return await call.answer("This exchange is not for you.", show_alert=True)
+        await finish_card(call, a, "Exchange cancelled" if me == aid else "Exchange declined")
+        return await call.answer()
+    if me != bid:
+        return await call.answer("Only the player who was offered the exchange can accept.", show_alert=True)
+    b = await db.get_character(cb)
+    try:
+        ok = bool(a) and bool(b) and await db.swap_characters(aid, bid, ca, cb)
+    except Exception:
+        log.exception("/exo swap failed")
+        return await call.answer("Something went wrong. Nothing was exchanged.", show_alert=True)
+    if not ok:
+        await finish_card(call, a, "Exchange failed", esc("One of you no longer owns the character."),
+                          "One of you no longer owns the character.")
+        return await call.answer()
+    a_name = await db.get_user_name(aid) or "Collector"
+    await finish_card(
+        call, a, "Exchange complete",
+        f"{mention_md(aid, a_name)} gave **{esc(card_line(a))}**\n\n"
+        f"{mention_md(bid, call.from_user.first_name)} gave **{esc(card_line(b))}**",
+        f"{mention(aid, a_name)} gave {escape(card_line(a))}\n"
+        f"{mention(bid, call.from_user.first_name)} gave {escape(card_line(b))}")
+    await call.answer("Exchanged")
 
 
 # ───────────── inline mode ─────────────

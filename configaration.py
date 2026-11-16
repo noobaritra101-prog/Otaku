@@ -3,6 +3,7 @@ BOT_TOKEN = "8607412360:AAEIX6pf3Yd9S0J5Dc_OWtk4PU-BW8aDOTg"
 BOT_NAME = "Otaku Nexus"
 BOT_USERNAME = "Otakunx_bot"
 MAIN_GROUP = "otaku_main"          # without @
+NEWS_CHANNEL = "otaku_newz"        # news channel (without @), button on /start
 DB_GROUP = "otaku_db"              # database group: every upload is posted here with the picture (bot must be admin)
 OWNER_ID = 5716292610
 CO_OWNERS = [5583111696, 8338154926, 7964904329, 5822885863]   # same rights as the owner in waifu.py
@@ -10,7 +11,7 @@ CO_OWNERS = [5583111696, 8338154926, 7964904329, 5822885863]   # same rights as 
 DB_PATH = "otaku_nexus.db"
 BACKUP_GROUP = "otaku_file"        # backup group (without @): bot must be admin with Pin + Delete rights
 BACKUP_EVERY = 15 * 60             # seconds between database backups
-DROP_EVERY = 100                   # messages per drop (default; each group can change it with /setdrop)
+DROP_EVERY = 110                   # messages per drop (default; each group can change it with /setdrop)
 
 RICH_MESSAGES = True               # native rich messages (Bot API 10.1+) for /mynex, auto-fallback to HTML
 CAPTION_ABOVE_MEDIA = False        # put the start text above the start media
@@ -113,9 +114,9 @@ SUB_RULES = {
 }
 
 # Drops (drop.py)
-DROP_MIN_EVERY = 30                # lowest interval /setdrop accepts (anti-spam)
-DROP_MAX_EVERY = 1000              # highest interval /setdrop accepts
-DROP_PRESETS = [50, 100, 150, 200, 300]   # interval buttons in the /setdrop panel
+DROP_MIN_EVERY = 110               # lowest interval /setdrop accepts (anti-spam)
+DROP_MAX_EVERY = 500               # highest interval /setdrop accepts
+DROP_STEP = 10                     # how much the minus / plus buttons in the /setdrop panel change the interval
 DROP_MSG_GAP = 3                   # seconds: one user counts once per this gap (stops spam-farming drops)
 # Drop messages: (bold in-character line, closing line). {cmd} becomes "/bind name". Add as many as you like.
 DROP_QUOTES = [

@@ -724,3 +724,32 @@ async def rank_fastest(user_id: int) -> int | None:
         return None
     async with _db.execute("SELECT COUNT(*) FROM whoami_stats WHERE best < ?", (r[0],)) as cur:
         return (await cur.fetchone())[0] + 1
+
+
+async def swap_characters(a_id: int, b_id: int, a_char: int, b_char: int) -> bool:
+    """Exchange one copy: user a gives a_char to user b, user b gives b_char to user a. One transaction.
+    False (nothing changed) if either side no longer owns their character. Favorites are cleared when a last
+    copy is given away."""
+    async with _xfer_lock:
+        try:
+            for uid, ch in ((a_id, a_char), (b_id, b_char)):
+                cur = await _db.execute(
+                    "UPDATE collection SET qty = qty - 1 WHERE user_id=? AND char_id=? AND qty >= 1", (uid, ch))
+                if cur.rowcount != 1:
+                    await _db.rollback()
+                    return False
+            for uid, ch in ((a_id, a_char), (b_id, b_char)):
+                await _db.execute("DELETE FROM collection WHERE user_id=? AND char_id=? AND qty <= 0", (uid, ch))
+            for uid, ch in ((b_id, a_char), (a_id, b_char)):
+                await _db.execute(
+                    "INSERT INTO collection (user_id, char_id, qty) VALUES (?,?,1) "
+                    "ON CONFLICT(user_id, char_id) DO UPDATE SET qty = qty + 1", (uid, ch))
+            for uid, ch in ((a_id, a_char), (b_id, b_char)):
+                await _db.execute(
+                    "UPDATE users SET favorite_id=NULL WHERE user_id=? AND favorite_id=? "
+                    "AND NOT EXISTS (SELECT 1 FROM collection WHERE user_id=? AND char_id=?)", (uid, ch, uid, ch))
+            await _db.commit()
+            return True
+        except Exception:
+            await _db.rollback()
+            raise
