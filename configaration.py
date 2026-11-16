@@ -9,6 +9,8 @@ OWNER_ID = 5716292610
 CO_OWNERS = [5583111696, 8338154926, 7964904329, 5822885863]   # same rights as the owner in waifu.py
 
 DB_PATH = "otaku_nexus.db"
+GITHUB_REPO = "noobaritra101-prog/Otaku"   # /gpull (owner only) pulls the code from this public repo
+GITHUB_BRANCH = ""                 # "" = the repo's default branch
 BACKUP_GROUP = "otaku_file"        # backup group (without @): bot must be admin with Pin + Delete rights
 BACKUP_EVERY = 15 * 60             # seconds between database backups
 DROP_EVERY = 110                   # messages per drop (default; each group can change it with /setdrop)
