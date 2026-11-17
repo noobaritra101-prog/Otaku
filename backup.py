@@ -51,7 +51,7 @@ def _fmt(title: str, text: str) -> str:
 
 
 async def notice(m: Message, title: str, text: str) -> Message:
-    """Plain reply to the command (no rich message)."""
+    """Plain HTML reply to the command."""
     return await m.reply(_fmt(title, text))
 
 
@@ -369,6 +369,16 @@ def _check_db(path: str) -> None:
         raise ValueError("no bot tables (users / characters / collection) in this database")
 
 
+def _normalise(path: str) -> None:
+    """Rewrite the file as a clean standalone database (journal mode DELETE, no WAL dependency). Blocking."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("PRAGMA journal_mode=DELETE")
+        con.commit()
+    finally:
+        con.close()
+
+
 def _swap_in(raw: bytes) -> None:
     """Put the new database in place; the current one is kept as <db>.bak. Blocking."""
     tmp = DB_PATH + ".import"
@@ -376,8 +386,13 @@ def _swap_in(raw: bytes) -> None:
         f.write(raw)
     try:
         _check_db(tmp)
+        _normalise(tmp)
     except Exception:
-        os.remove(tmp)
+        for ext in ("", "-wal", "-shm", "-journal"):
+            try:
+                os.remove(tmp + ext)
+            except OSError:
+                pass
         raise
     if os.path.exists(DB_PATH):
         shutil.copy2(DB_PATH, DB_PATH + ".bak")
@@ -422,7 +437,7 @@ async def import_db(bot, doc, progress=None) -> tuple[bool, str]:
     await say("Downloading the file...")
     buf = io.BytesIO()
     try:
-        await bot.download(doc.file_id, destination=buf)
+        await asyncio.wait_for(bot.download(doc.file_id, destination=buf), timeout=120)
         raw = await asyncio.to_thread(_extract_db, buf.getvalue())
     except Exception as e:
         log.exception("import: could not read the file")
@@ -461,25 +476,29 @@ async def _backup_after_import(bot, msg: Message, text: str) -> None:
     await _edit(msg, "Database imported", text + (" Backup sent and pinned." if ok else f" Backup failed: {info}"))
 
 
-@router.message(Command("import"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
-async def import_cmd(m: Message):
-    status = await notice(m, "Import", "Got it, working on it...")      # instant reply
+async def _do_import(bot, status: Message, doc) -> None:
+    """The slow part, runs in the background so the command is answered instantly."""
+    async def progress(t: str) -> None:
+        await _edit(status, "Import", t)
+
     try:
-        doc = m.document or (m.reply_to_message.document if m.reply_to_message else None)
-        if not doc:
-            return await _edit(status, "Import", "Send the old .db (or backup .zip) file with /import as the caption, "
-                                                 "or reply to the file with /import.")
-
-        async def progress(t: str) -> None:
-            await _edit(status, "Import", t)
-
-        ok, text = await import_db(m.bot, doc, progress)
+        ok, text = await import_db(bot, doc, progress)
     except Exception as e:
         log.exception("import crashed")
         return await _edit(status, "Import failed", _err(e))
     if not ok:
         return await _edit(status, "Import failed", text)
     await _edit(status, "Database imported", text + " Sending a backup...")
-    t = asyncio.create_task(_backup_after_import(m.bot, status, text))
+    await _backup_after_import(bot, status, text)
+
+
+@router.message(Command("import"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
+async def import_cmd(m: Message):
+    status = await notice(m, "Import", "Got it, working on it...")      # instant reply, nothing before it
+    doc = m.document or (m.reply_to_message.document if m.reply_to_message else None)
+    if not doc:
+        return await _edit(status, "Import", "Send the old .db (or backup .zip) file with /import as the caption, "
+                                             "or reply to the file with /import.")
+    t = asyncio.create_task(_do_import(m.bot, status, doc))
     _tasks.add(t)
     t.add_done_callback(_tasks.discard)

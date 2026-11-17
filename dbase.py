@@ -1,9 +1,12 @@
 import asyncio
+import logging
+import sqlite3
 import time
 
 import aiosqlite
 from configaration import DB_PATH
 
+log = logging.getLogger("otaku.db")
 _db: aiosqlite.Connection | None = None
 nex_lock = asyncio.Lock()    # serialises Nex transfers / bets across modules
 
@@ -46,7 +49,6 @@ CREATE TABLE IF NOT EXISTS characters (
     db_msg_id   INTEGER,
     media_type  TEXT NOT NULL DEFAULT 'photo'
 );
-CREATE INDEX IF NOT EXISTS idx_char_rarity ON characters(rarity);
 
 CREATE TABLE IF NOT EXISTS admins (
     user_id INTEGER PRIMARY KEY
@@ -91,9 +93,47 @@ CREATE TABLE IF NOT EXISTS whoami_wins (
 ) WITHOUT ROWID;
 """
 
+INDEXES = "CREATE INDEX IF NOT EXISTS idx_char_rarity ON characters(rarity);"
+
+
+async def _add_missing_columns() -> None:
+    """Old databases: add every column the current layout has and the old table lacks."""
+    ref = sqlite3.connect(":memory:")
+    try:
+        ref.executescript(SCHEMA)
+        tables = [r[0] for r in ref.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for t in tables:
+            want = ref.execute(f"PRAGMA table_info({t})").fetchall()      # cid, name, type, notnull, dflt, pk
+            async with _db.execute(f"PRAGMA table_info({t})") as cur:
+                have = {r["name"] for r in await cur.fetchall()}
+            for _cid, name, typ, notnull, dflt, pk in want:
+                if name in have or pk:
+                    continue
+                if dflt is not None and "(" not in str(dflt):
+                    default = f" DEFAULT {dflt}"
+                elif notnull or dflt is not None:                          # NOT NULL / expression default
+                    default = " DEFAULT ''" if "CHAR" in typ.upper() or "TEXT" in typ.upper() else " DEFAULT 0"
+                else:
+                    default = ""
+                null = " NOT NULL" if notnull else ""
+                try:
+                    await _db.execute(f"ALTER TABLE {t} ADD COLUMN {name} {typ}{null}{default}")
+                    log.info("migrated: added %s.%s", t, name)
+                except Exception:
+                    log.exception("could not add column %s.%s", t, name)
+    finally:
+        ref.close()
+
 
 async def init_db() -> None:
     global _db
+    if _db is not None:                      # never leave an old connection open behind a new one
+        try:
+            await _db.close()
+        except Exception:
+            pass
+        _db = None
     _db = await aiosqlite.connect(DB_PATH)
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA journal_mode=WAL")
@@ -124,12 +164,19 @@ async def init_db() -> None:
         chcols = {r["name"] for r in await cur.fetchall()}
     if "drop_enabled" not in chcols:
         await _db.execute("ALTER TABLE chats ADD COLUMN drop_enabled INTEGER NOT NULL DEFAULT 1")
+    await _add_missing_columns()
+    try:
+        await _db.executescript(INDEXES)
+    except Exception:
+        log.exception("could not create indexes")
     await _db.commit()
 
 
 async def close_db() -> None:
+    global _db
     if _db:
-        await _db.close()
+        db, _db = _db, None
+        await db.close()
 
 
 # ---------- settings ----------
