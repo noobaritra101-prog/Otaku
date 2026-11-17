@@ -11,17 +11,21 @@
 Port: the PORT environment variable (Railway sets it), default 8080. Everything is read-only and public data
 (no user ids besides the owner, no balances). CORS is open so the page can also be hosted elsewhere.
 """
+import hmac
+import hashlib
 import io
+import json
 import logging
 import os
 import time
 from collections import OrderedDict
+from urllib.parse import parse_qsl
 
 from aiohttp import ClientSession, ClientTimeout, web
 
 import dbase as db
 from configaration import (
-    CURRENCY_NAME, CURRENCY_SYMBOL, DAILY_AMOUNT, DAILY_BIO_AMOUNT, DROP_MAX_EVERY, DROP_MIN_EVERY, GUESS_DAILY_CAP,
+    BOT_TOKEN, CURRENCY_NAME, CURRENCY_SYMBOL, DAILY_AMOUNT, DAILY_BIO_AMOUNT, DROP_MAX_EVERY, DROP_MIN_EVERY, GUESS_DAILY_CAP,
     GUESS_REWARD, GUESS_SECONDS, MINES_DEFAULT, MINES_MAX_BET, MINES_MIN_BET, MINES_MIN_CASHOUT, MINES_RTP,
     MINES_TIMEOUT, OWNER_ID, RARITIES, SHOP_PRICES, SHOP_SLOTS, SHOP_SUNDAY_SLOTS, SHOP_UTC_OFFSET_MIN,
     SLOT_MAX_SPINS, SLOT_REWARD_JACKPOT, SLOT_REWARD_PAIR, SLOT_REWARD_TRIPLE, SLOT_REWARD_TWO_SEVENS, SUB_RARITIES,
@@ -38,14 +42,46 @@ _img: "OrderedDict[int, tuple[bytes, str]]" = OrderedDict()      # char id -> (b
 _logo: tuple[bytes, str] | None = None
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Init-Data",
+    "Access-Control-Max-Age": "86400",
+}
+
+
 @web.middleware
 async def cors(request: web.Request, handler):
+    # The mini app lives on another origin (Netlify) and sends the X-Init-Data header, so the browser first
+    # sends an OPTIONS preflight. Without answering it (and allowing that header) every call is "Failed to fetch".
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS_HEADERS)
     try:
         resp = await handler(request)
     except web.HTTPException as e:
         resp = e
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers.update(CORS_HEADERS)
     return resp
+
+
+def tg_user_id(request: web.Request) -> int | None:
+    """Validate Telegram WebApp initData (X-Init-Data header) and return the user's id, else None."""
+    raw = request.headers.get("X-Init-Data", "")
+    if not raw:
+        return None
+    try:
+        data = dict(parse_qsl(raw, keep_blank_values=True))
+        got = data.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(key, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got):
+            return None
+        if time.time() - int(data.get("auth_date", "0")) > 86400:
+            return None
+        return int(json.loads(data["user"])["id"])
+    except Exception:
+        return None
 
 
 async def index(request: web.Request):
@@ -90,6 +126,26 @@ async def collection(request: web.Request):
     return web.json_response({"owner": await db.get_user_name(OWNER_ID) or "Owner", "cards": cards})
 
 
+def _need_user(request: web.Request) -> int:
+    uid = tg_user_id(request)
+    if uid is None:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Open this from the bot."}), content_type="application/json")
+    return uid
+
+
+async def my_collection(request: web.Request):
+    uid = _need_user(request)
+    rows = await db.owner_cards(uid)
+    cards = [[r["char_id"], r["name"], r["anime"], r["rarity"], r["sub_rarity"] or "", r["qty"],
+              KIND.get(r["media_type"], "p")] for r in rows]
+    return web.json_response({"cards": cards})
+
+
+async def me(request: web.Request):
+    uid = _need_user(request)
+    return web.json_response({"nex": await db.get_nex(uid)})
+
+
 async def picture(request: web.Request):
     try:
         cid = int(request.match_info["cid"])
@@ -97,7 +153,8 @@ async def picture(request: web.Request):
         raise web.HTTPNotFound()
     hit = _img.get(cid)
     if not hit:
-        c = await db.owner_card(OWNER_ID, cid)
+        # <img>/<video> tags cannot send the X-Init-Data header, so pictures are served for any character
+        c = await db.get_character(cid)
         if not c:
             raise web.HTTPNotFound()
         buf = io.BytesIO()
@@ -135,6 +192,7 @@ async def start(bot) -> web.AppRunner | None:
         app.add_routes([
             web.get("/", index), web.get("/index.html", index), web.get("/health", health),
             web.get("/logo.png", logo), web.get("/api/overview", overview), web.get("/api/collection", collection),
+            web.get("/api/mycollection", my_collection), web.get("/api/me", me),
             web.get("/api/img/{cid}", picture),
         ])
         runner = web.AppRunner(app)
