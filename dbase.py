@@ -753,3 +753,80 @@ async def swap_characters(a_id: int, b_id: int, a_char: int, b_char: int) -> boo
         except Exception:
             await _db.rollback()
             raise
+
+
+# ---------- /waifuverse and /search ----------
+_VAKEY = "LOWER(TRIM(anime))"
+
+
+async def verse_anime_count() -> int:
+    async with _db.execute(f"SELECT COUNT(DISTINCT {_VAKEY}) FROM characters") as cur:
+        return (await cur.fetchone())[0]
+
+
+async def verse_anime_page(offset: int = 0, limit: int = 10):
+    """Series A to Z. Rows: akey, anime, n (characters in it)."""
+    sql = (f"SELECT {_VAKEY} AS akey, MIN(anime) AS anime, COUNT(*) AS n FROM characters "
+           f"GROUP BY akey ORDER BY akey LIMIT ? OFFSET ?")
+    async with _db.execute(sql, (limit, offset)) as cur:
+        return await cur.fetchall()
+
+
+async def verse_chars_count(akey: str | None = None) -> int:
+    sql, args = "SELECT COUNT(*) FROM characters", ()
+    if akey is not None:
+        sql, args = f"{sql} WHERE {_VAKEY}=?", (akey,)
+    async with _db.execute(sql, args) as cur:
+        return (await cur.fetchone())[0]
+
+
+async def verse_chars_page(akey: str | None = None, offset: int = 0, limit: int = 15):
+    """Characters by ID (all, or one series)."""
+    sql, args = "SELECT char_id, name, anime, rarity, sub_rarity FROM characters", []
+    if akey is not None:
+        sql += f" WHERE {_VAKEY}=?"
+        args.append(akey)
+    sql += " ORDER BY char_id LIMIT ? OFFSET ?"
+    async with _db.execute(sql, (*args, limit, offset)) as cur:
+        return await cur.fetchall()
+
+
+def _search_where(query: str) -> tuple[str, list]:
+    """Every word must appear in the name or the series; a number (or #number) also matches the ID."""
+    q = query.strip().lstrip("#").strip()
+    words = q.lower().split()[:6]
+    conds, args = [], []
+    for w in words:
+        like = "%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        conds.append("(LOWER(name) LIKE ? ESCAPE '\\' OR LOWER(anime) LIKE ? ESCAPE '\\')")
+        args += [like, like]
+    where = " AND ".join(conds) or "0"
+    if q.isdigit():
+        where = f"({where}) OR char_id = ?"
+        args.append(int(q))
+    return where, args
+
+
+async def search_count(query: str) -> int:
+    where, args = _search_where(query)
+    async with _db.execute(f"SELECT COUNT(*) FROM characters WHERE {where}", args) as cur:
+        return (await cur.fetchone())[0]
+
+
+async def search_page(query: str, offset: int = 0, limit: int = 10):
+    """Exact ID first, then exact name, then names starting with the text, then the rest A to Z."""
+    where, args = _search_where(query)
+    q = query.strip().lstrip("#").strip().lower()
+    esc_q = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    sql = (f"SELECT * FROM characters WHERE {where} ORDER BY (char_id = ?) DESC, (LOWER(name) = ?) DESC, "
+           f"(LOWER(name) LIKE ? ESCAPE '\\') DESC, LOWER(name), char_id LIMIT ? OFFSET ?")
+    async with _db.execute(sql, (*args, int(q) if q.isdigit() else -1, q, esc_q + "%", limit, offset)) as cur:
+        return await cur.fetchall()
+
+
+async def card_totals(char_id: int) -> tuple[int, int]:
+    """(people who own it, copies in total)."""
+    async with _db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(qty), 0) FROM collection WHERE char_id=?", (char_id,)) as cur:
+        r = await cur.fetchone()
+    return r[0], r[1]
