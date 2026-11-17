@@ -69,13 +69,17 @@ def char_line(c) -> str:
     return f"{name_tag(c)} - {rarity_label(c['rarity'])}"
 
 
-def char_lines(rows) -> tuple[list[str], list[str]]:
-    """Numbered by character ID (alternating "." / ")" so every item starts its own numbered list)."""
+TICK, BOX = "✅", "⬜"
+
+
+def char_lines(rows, owned: set[int]) -> tuple[list[str], list[str]]:
+    """Checklist of characters. Rich: a real task list (`- [x]` owned, `- [ ]` not yet) with the ID at the end.
+    HTML fallback: numbered by ID with ✅ / ⬜."""
     md, html = [], []
-    for n, c in enumerate(rows):
-        delim = "." if n % 2 == 0 else ")"
-        md.append(f"> {c['char_id']}{delim} {esc(char_line(c))}")
-        html.append(f"{c['char_id']}. {escape(char_line(c))}")
+    for c in rows:
+        have = c["char_id"] in owned
+        md.append(f"- [{'x' if have else ' '}] {esc(char_line(c))} · ID {c['char_id']}")
+        html.append(f"{c['char_id']}. {TICK if have else BOX} {escape(char_line(c))}")
     return md, html
 
 
@@ -86,11 +90,11 @@ async def verse_view(uid: int, view: str, page: int, idx: int = 0):
         total = await db.verse_anime_count()
         pages = max(1, (total + ANIME_PER_PAGE - 1) // ANIME_PER_PAGE)
         page = min(max(page, 0), pages - 1)
-        rows = await db.verse_anime_page(page * ANIME_PER_PAGE, ANIME_PER_PAGE)
+        rows = await db.verse_anime_page(page * ANIME_PER_PAGE, ANIME_PER_PAGE, uid)
         chars = await db.verse_chars_count()
         lines_md, lines_h = [], []
         for i, r in enumerate(rows, page * ANIME_PER_PAGE + 1):
-            tail = f"{r['n']} character{'s' if r['n'] != 1 else ''}"
+            tail = f"{r['owned']}/{r['n']} owned"
             lines_md.append(f"> {i}. **{esc(cut(r['anime'], 40))}** - {tail}")
             lines_h.append(f"{i}. <b>{escape(cut(r['anime'], 40))}</b> - {tail}")
         if not lines_md:
@@ -116,7 +120,7 @@ async def verse_view(uid: int, view: str, page: int, idx: int = 0):
         pages = max(1, (total + CHARS_PER_PAGE - 1) // CHARS_PER_PAGE)
         page = min(max(page, 0), pages - 1)
         rows = await db.verse_chars_page(None, page * CHARS_PER_PAGE, CHARS_PER_PAGE)
-        lines_md, lines_h = char_lines(rows)
+        lines_md, lines_h = char_lines(rows, await db.owned_among(uid, [c["char_id"] for c in rows]))
         if not lines_md:
             lines_md, lines_h = ["> Nothing here yet."], ["Nothing here yet."]
         md = (f"# Waifuverse : ==Characters==\n\n{total} characters\n\n---\n\n" + "\n".join(lines_md)
@@ -137,7 +141,7 @@ async def verse_view(uid: int, view: str, page: int, idx: int = 0):
 
 async def series_view(uid: int, idx: int, back_page: int, page: int):
     """Characters of one series. Returns (md, html, kb_factory) or None when the series is gone."""
-    row = await db.verse_anime_page(idx, 1)
+    row = await db.verse_anime_page(idx, 1, uid)
     if not row:
         return None
     akey, name = row[0]["akey"], row[0]["anime"]
@@ -145,10 +149,12 @@ async def series_view(uid: int, idx: int, back_page: int, page: int):
     pages = max(1, (total + CHARS_PER_PAGE - 1) // CHARS_PER_PAGE)
     page = min(max(page, 0), pages - 1)
     rows = await db.verse_chars_page(akey, page * CHARS_PER_PAGE, CHARS_PER_PAGE)
-    lines_md, lines_h = char_lines(rows)
-    md = (f"# Series : =={esc(cut(name, 40))}==\n\n{total} character{'s' if total != 1 else ''}\n\n---\n\n"
+    owned = await db.owned_among(uid, [c["char_id"] for c in rows])
+    have = row[0]["owned"] if "owned" in row[0].keys() else 0
+    lines_md, lines_h = char_lines(rows, owned)
+    md = (f"# Series : =={esc(cut(name, 40))}==\n\n{have}/{total} owned\n\n---\n\n"
           + "\n".join(lines_md) + f"\n\n---\n\n###### Page {page + 1}/{pages}")
-    html = (f"<b>Series : {escape(cut(name, 40))}</b>\n{total} character{'s' if total != 1 else ''}\n"
+    html = (f"<b>Series : {escape(cut(name, 40))}</b>\n{have}/{total} owned\n"
             f"<blockquote expandable>" + "\n".join(lines_h) + f"</blockquote>\nPage {page + 1}/{pages}")
 
     def kb(styled: bool = True) -> InlineKeyboardMarkup:
@@ -275,9 +281,7 @@ async def card_view(c) -> tuple[str, str]:
     rows = [("Series", c["anime"]), ("Rarity", rarity_label(c["rarity"]))]
     if sub:
         rows.append(("Sub rarity", sub_label(sub)))
-    rows += [("Type", "Husbando" if c["gender"] == "husbando" else "Waifu"), ("ID", str(c["char_id"]))]
-    if c["artist_name"]:
-        rows.append(("Artist", c["artist_name"]))
+    rows.append(("ID", str(c["char_id"])))
     rows.append(("Owned by", f"{owners} player{'s' if owners != 1 else ''} · {copies} cop{'ies' if copies != 1 else 'y'}"))
 
     md = f"# {esc(cut(c['name'], 60))}\n\n---\n\n" + "\n>\n".join(f"> {k} : {esc(v)}" for k, v in rows)
@@ -314,9 +318,12 @@ async def search_view(uid: int, tok: str, query: str, page: int):
     page = min(max(page, 0), pages - 1)
     rows = await db.search_page(query, page * SEARCH_PER_PAGE, SEARCH_PER_PAGE)
     lines_md, lines_h = [], []
+    owned = await db.owned_among(uid, [c["char_id"] for c in rows])
     for i, c in enumerate(rows, page * SEARCH_PER_PAGE + 1):
-        lines_md.append(f"> {i}. **{esc(name_tag(c))}** - {esc(cut(c['anime'], 30))} · {esc(rarity_label(c['rarity']))} · ID {c['char_id']}")
-        lines_h.append(f"{i}. <b>{escape(name_tag(c))}</b> - {escape(cut(c['anime'], 30))} · {escape(rarity_label(c['rarity']))} · ID {c['char_id']}")
+        mark = TICK if c["char_id"] in owned else BOX
+        box = "x" if c["char_id"] in owned else " "
+        lines_md.append(f"- [{box}] {i} · **{esc(name_tag(c))}** - {esc(cut(c['anime'], 30))} · {esc(rarity_label(c['rarity']))} · ID {c['char_id']}")
+        lines_h.append(f"{i}. {mark} <b>{escape(name_tag(c))}</b> - {escape(cut(c['anime'], 30))} · {escape(rarity_label(c['rarity']))} · ID {c['char_id']}")
     shown = cut(query, 30)
     md = (f"# Search : =={esc(shown)}==\n\n{total} result{'s' if total != 1 else ''}\n\n---\n\n"
           + "\n".join(lines_md) + f"\n\n---\n\n###### Page {page + 1}/{pages}")
@@ -399,8 +406,13 @@ async def search_pick_cb(call: CallbackQuery):
         if not c:
             return await call.answer("This character was removed.", show_alert=True)
         msg = call.message
-        await send_card(call.bot, msg.chat.id, c, topic_id(msg), msg.message_id)
+        origin = msg.reply_to_message.message_id if msg.reply_to_message else None
+        await send_card(call.bot, msg.chat.id, c, topic_id(msg), origin)
     except Exception:
         log.exception("/search open failed")
         return await call.answer("Something went wrong.", show_alert=True)
+    try:                                              # the list is not needed any more
+        await msg.delete()
+    except Exception as e:
+        log.debug("could not delete the search list: %s", e)
     await call.answer()

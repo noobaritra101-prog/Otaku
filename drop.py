@@ -16,7 +16,7 @@ Inline mode (@botusername)
 - empty query: every character, newest first (50 per page); text filters by name, series, rarity, sub rarity, ID.
 - "collection.<user id>" (the View Collection button): that user's characters; text after it filters the same
   way. Plain "collection" = the asker's own collection (personal).
-- Each result has a "Check binds" button (top 10 owners, private alert).
+- Normal results have a "Check binds" button: it edits the card caption with the top 10 binds and "Checked by". Collection results ("collection.<id>") say "OMG!! Check Out This Character of <owner>!" and have no button. Captions also show the series.
 - Spoiler: Telegram has no spoiler flag for inline results, so the bot edits the sent inline message with
   has_spoiler=True after chosen_inline_result. BotFather needs /setinline and /setinlinefeedback (100%).
 """
@@ -376,13 +376,14 @@ def panel_md(st: ChatState) -> str:
 
 
 def panel_kb(st: ChatState, styled: bool = True) -> InlineKeyboardMarkup:
-    """One row: [minus] [current number] [plus]."""
+    """Row 1: [minus] [current number] [plus]. Row 2: [Save & Close]."""
     def b(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
         extra = {"style": style} if styled and style else {}
         return InlineKeyboardButton(text=text, callback_data=data, **extra)
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        b("➖", "sd:-", "danger"), b(str(st.every), "sd:n"), b("➕", "sd:+", "success"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b("➖", "sd:-", "danger"), b(str(st.every), "sd:n"), b("➕", "sd:+", "success")],
+        [b("Save & Close", "sd:x", "primary")],
+    ])
 
 
 async def _apply(chat_id: int, st: ChatState, every: int | None = None, enabled: bool | None = None) -> None:
@@ -468,6 +469,15 @@ async def setdrop_cb(call: CallbackQuery):
         return await call.answer()
     if action == "n":
         return await call.answer(f"A character drops every {st.every} messages.")
+    if action == "x":                       # every change is already saved: just close the panel
+        try:
+            await call.message.delete()
+        except TelegramAPIError:
+            try:
+                await call.message.edit_reply_markup(reply_markup=None)
+            except TelegramAPIError:
+                pass
+        return await call.answer(f"Saved: a character drops every {st.every} messages.", show_alert=True)
     await call.answer()
 
 
@@ -826,13 +836,31 @@ CACHE_SECONDS = 30
 SPOILER_RETRY_DELAYS = (0.4, 1.2, 2.5)
 
 
-def caption(c) -> str:
-    return (
-        "<b>OMG !! Check out This Character !</b>\n\n"
+def caption(c, owner: tuple[int, str] | None = None, binds=None, by=None) -> str:
+    """Inline card caption.
+    owner = (user id, name) when the card comes from someone's collection ("OMG!! Check Out This Character of X!").
+    binds = top holder rows and by = the user who pressed Check binds (shown under the card)."""
+    head = ("<b>OMG!! Check Out This Character of " + mention(owner[0], owner[1]) + "!</b>"
+            if owner else "<b>OMG !! Check out This Character !</b>")
+    text = (
+        f"{head}\n\n"
         f"<b>Name :</b> {escape(name_tag(c))}\n"
+        f"<b>Series :</b> {escape(c['anime'])}\n"
         f"<b>Rarity : </b>{rarity_label(c['rarity'])}\n"
         f"<b>Global ID :</b> {c['char_id']}"
     )
+    if by is not None:
+        text += "\n\n<b>Top binds</b>\n<blockquote>"
+        if binds:
+            lines = []
+            for i, r in enumerate(binds, 1):
+                nm = (r["first_name"] or (f"@{r['username']}" if r["username"] else str(r["user_id"]))).replace("\n", " ")
+                lines.append(f"{i}. {escape(nm[:20])} x{r['qty']}")
+            text += "\n".join(lines)
+        else:
+            text += "Nobody has bound this character yet."
+        text += f"</blockquote>\n<b>Checked by :</b> {mention(by.id, by.first_name)}"
+    return text
 
 
 def binds_kb(c, styled: bool = True) -> InlineKeyboardMarkup:
@@ -841,8 +869,11 @@ def binds_kb(c, styled: bool = True) -> InlineKeyboardMarkup:
         text="Check binds", callback_data=f"bn:{c['char_id']}", **extra)]])
 
 
-def to_result(c, styled: bool = True):
-    rid, cap, kb = str(c["char_id"]), caption(c), binds_kb(c, styled)
+def to_result(c, styled: bool = True, owner: tuple[int, str] | None = None):
+    """Normal inline card: Check binds button. Collection card (owner set): "of <owner>" caption, no button;
+    its result id is <char id>.<owner id> so the spoiler edit can rebuild the same caption."""
+    rid = f"{c['char_id']}.{owner[0]}" if owner else str(c["char_id"])
+    cap, kb = caption(c, owner), (None if owner else binds_kb(c, styled))
     title, desc = name_tag(c), f"{c['anime']} · {c['rarity']}"
     if "qty" in c.keys():                      # own-collection results show the copies owned
         desc += f" · x{c['qty']}"
@@ -860,9 +891,9 @@ def to_result(c, styled: bool = True):
         caption=cap, parse_mode="HTML", reply_markup=kb)
 
 
-def to_input_media(c):
+def to_input_media(c, owner: tuple[int, str] | None = None):
     """Same card as an InputMedia with the spoiler on (used to edit the sent inline message)."""
-    kw = dict(media=c["file_id"], caption=caption(c), parse_mode="HTML", has_spoiler=True)
+    kw = dict(media=c["file_id"], caption=caption(c, owner), parse_mode="HTML", has_spoiler=True)
     if c["media_type"] == "video":
         return InputMediaVideo(**kw)
     if c["media_type"] == "animation":
@@ -875,8 +906,10 @@ async def inline_cmd(q: InlineQuery):
     offset = int(q.offset) if q.offset.isdigit() else 0
     mc = COLL_RE.match(q.query.strip())
     own = mc is not None
+    owner = None
     if own:
         uid = int(mc.group(1)) if mc.group(1) else q.from_user.id
+        owner = (uid, (await db.get_user_name(uid)) or (q.from_user.first_name if uid == q.from_user.id else "a collector"))
         rows = await db.search_collection(uid, mc.group(2) or "", offset, PAGE)
     else:
         rows = await db.search_characters(q.query, offset, PAGE)
@@ -886,7 +919,7 @@ async def inline_cmd(q: InlineQuery):
         out = []
         for c in rows:
             try:
-                out.append(to_result(c, styled))
+                out.append(to_result(c, styled, owner))
             except Exception:
                 log.exception("inline: bad card %s", c["char_id"])
         if own and not out and offset == 0:
@@ -907,16 +940,21 @@ async def inline_cmd(q: InlineQuery):
 @router.chosen_inline_result()
 async def spoiler_cb(r: ChosenInlineResult, bot: Bot):
     """Put the spoiler on a card that was just sent through inline mode."""
-    if not r.inline_message_id or not r.result_id.isdigit():
+    cid, _, oid = r.result_id.partition(".")
+    if not r.inline_message_id or not cid.isdigit():
         return
-    c = await db.get_character(int(r.result_id))
+    c = await db.get_character(int(cid))
     if not c:
         return
+    owner = None
+    if oid.isdigit():
+        owner = (int(oid), (await db.get_user_name(int(oid))) or "a collector")
     for delay in SPOILER_RETRY_DELAYS:
         await asyncio.sleep(delay)
         try:
             await with_styles(lambda s: bot.edit_message_media(
-                media=to_input_media(c), inline_message_id=r.inline_message_id, reply_markup=binds_kb(c, s)))
+                media=to_input_media(c, owner), inline_message_id=r.inline_message_id,
+                reply_markup=None if owner else binds_kb(c, s)))
             return
         except TelegramAPIError as e:
             log.debug("spoiler edit retry for card %s: %s", c["char_id"], e)
@@ -940,8 +978,26 @@ def holders_text(c, rows) -> str:
 
 @router.callback_query(F.data.startswith("bn:"))
 async def binds_cb(call: CallbackQuery):
+    """Check binds: the card's caption is edited to list the top binds and who checked (no alert)."""
     cid = call.data[3:]
     c = await db.get_character(int(cid)) if cid.isdigit() else None
     if not c:
         return await call.answer("This character no longer exists.", show_alert=True)
-    await call.answer(holders_text(c, await db.top_holders(c["char_id"], 10)), show_alert=True)
+    rows = await db.top_holders(c["char_id"], 10)
+    cap = caption(c, None, rows, call.from_user)
+    try:
+        if call.inline_message_id:
+            await with_styles(lambda s: call.bot.edit_message_caption(
+                inline_message_id=call.inline_message_id, caption=cap, reply_markup=binds_kb(c, s)))
+        elif call.message:
+            await with_styles(lambda s: call.message.edit_caption(caption=cap, reply_markup=binds_kb(c, s)))
+        else:
+            return await call.answer(holders_text(c, rows), show_alert=True)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():          # same people, same binds: nothing to change
+            log.warning("check binds edit failed: %s", e)
+            return await call.answer(holders_text(c, rows), show_alert=True)
+    except TelegramAPIError as e:
+        log.warning("check binds edit failed: %s", e)
+        return await call.answer(holders_text(c, rows), show_alert=True)
+    await call.answer()

@@ -764,11 +764,13 @@ async def verse_anime_count() -> int:
         return (await cur.fetchone())[0]
 
 
-async def verse_anime_page(offset: int = 0, limit: int = 10):
-    """Series A to Z. Rows: akey, anime, n (characters in it)."""
-    sql = (f"SELECT {_VAKEY} AS akey, MIN(anime) AS anime, COUNT(*) AS n FROM characters "
-           f"GROUP BY akey ORDER BY akey LIMIT ? OFFSET ?")
-    async with _db.execute(sql, (limit, offset)) as cur:
+async def verse_anime_page(offset: int = 0, limit: int = 10, uid: int = 0):
+    """Series A to Z. Rows: akey, anime, n (characters in it), owned (how many of them uid owns)."""
+    sql = (f"SELECT {_VAKEY} AS akey, MIN(anime) AS anime, COUNT(*) AS n, "
+           f"(SELECT COUNT(*) FROM collection c JOIN characters t ON t.char_id = c.char_id "
+           f"WHERE c.user_id = ? AND LOWER(TRIM(t.anime)) = {_VAKEY}) AS owned "
+           f"FROM characters GROUP BY akey ORDER BY akey LIMIT ? OFFSET ?")
+    async with _db.execute(sql, (uid, limit, offset)) as cur:
         return await cur.fetchall()
 
 
@@ -830,3 +832,39 @@ async def card_totals(char_id: int) -> tuple[int, int]:
         "SELECT COUNT(*), COALESCE(SUM(qty), 0) FROM collection WHERE char_id=?", (char_id,)) as cur:
         r = await cur.fetchone()
     return r[0], r[1]
+
+
+async def owned_among(user_id: int, ids: list[int]) -> set[int]:
+    """Which of these character IDs the user owns (for the checklist ticks)."""
+    if not ids:
+        return set()
+    async with _db.execute(
+        f"SELECT char_id FROM collection WHERE user_id=? AND char_id IN ({','.join('?' * len(ids))})",
+        (user_id, *ids)) as cur:
+        return {r[0] for r in await cur.fetchall()}
+
+
+# ---------- series / name checks for /upload ----------
+async def series_counts():
+    """Every spelling of a series with its character count."""
+    async with _db.execute("SELECT anime, COUNT(*) AS n FROM characters GROUP BY anime") as cur:
+        return await cur.fetchall()
+
+
+async def all_char_names() -> list[str]:
+    async with _db.execute("SELECT DISTINCT name FROM characters") as cur:
+        return [r[0] for r in await cur.fetchall()]
+
+
+async def rename_series(old_spellings: list[str], new: str) -> list[int]:
+    """Give every character of the listed spellings the series name `new`. Returns the changed character IDs."""
+    if not old_spellings:
+        return []
+    marks = ",".join("?" * len(old_spellings))
+    async with _db.execute(f"SELECT char_id FROM characters WHERE anime IN ({marks}) AND anime != ?",
+                           (*old_spellings, new)) as cur:
+        ids = [r[0] for r in await cur.fetchall()]
+    if ids:
+        await _db.execute(f"UPDATE characters SET anime=? WHERE anime IN ({marks})", (new, *old_spellings))
+        await _db.commit()
+    return ids

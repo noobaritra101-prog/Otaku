@@ -3,7 +3,10 @@
 Own router: otaku.py only does `import waifu` and `dp.include_router(waifu.router)`.
 Every upload is also posted with the picture to the database group (DB_GROUP).
 """
+import asyncio
 import logging
+import re
+import unicodedata
 from collections import Counter
 from html import escape
 
@@ -222,15 +225,151 @@ async def rm_admin_cmd(m: Message):
 
 
 # ───────────── /upload ─────────────
+# ───────────── series names: duplicate / typo protection ─────────────
+# series_key("Re:Zero") == series_key("re-zero") == series_key("The Re Zero") == "rezero" (lower case, no "the",
+# letters and digits only). _is_close() finds probable typos and longer / shorter titles ("rerezo").
+# Used by /upload (preview with Use existing / Keep mine), /edit Series, /dupes and /mergeseries.
+def series_key(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "").lower()
+    s = re.sub(r"\bthe\b", "", s)
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def _lev(a: str, b: str) -> int:
+    """Edit distance (small strings only)."""
+    if abs(len(a) - len(b)) > 3:
+        return 99
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _is_close(a: str, b: str) -> bool:
+    """Two different keys that probably mean the same series."""
+    if not a or not b or a == b:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 5 and short in long_:
+        return True
+    limit = 2 if min(len(a), len(b)) >= 6 else (1 if min(len(a), len(b)) >= 4 else 0)
+    return limit > 0 and _lev(a, b) <= limit
+
+
+async def series_catalog() -> dict[str, dict]:
+    """key -> {"name": most used spelling, "n": characters, "spellings": {spelling: count}}."""
+    cat: dict[str, dict] = {}
+    for r in await db.series_counts():
+        k = series_key(r["anime"])
+        if not k:
+            continue
+        e = cat.setdefault(k, {"name": r["anime"], "n": 0, "spellings": {}, "best": 0})
+        e["n"] += r["n"]
+        e["spellings"][r["anime"]] = r["n"]
+        if r["n"] > e["best"]:
+            e["name"], e["best"] = r["anime"], r["n"]
+    return cat
+
+
+def series_close(k: str, cat: dict[str, dict], limit: int = 3) -> list[str]:
+    """Spellings of existing series that look like key k (biggest series first)."""
+    found = [(e["n"], e["name"]) for ck, e in cat.items() if _is_close(k, ck)]
+    return [name for _, name in sorted(found, reverse=True)[:limit]]
+
+
+def series_clusters(cat: dict[str, dict]) -> list[list[tuple[str, int]]]:
+    """Groups of series that look like duplicates: [(spelling, characters), ...], biggest group first."""
+    keys = sorted(cat)
+    seen: set[str] = set()
+    out = []
+    for k in keys:
+        if k in seen:
+            continue
+        group = [k] + [o for o in keys if o != k and o not in seen and _is_close(k, o)]
+        seen.update(group)
+        spell = [(s, n) for g in group for s, n in cat[g]["spellings"].items()]
+        if len(spell) > 1:
+            out.append(sorted(spell, key=lambda x: -x[1]))
+    return sorted(out, key=lambda g: -sum(n for _, n in g))
+
+
 USAGE = (
     "Reply to a picture, video or GIF (or send it with this as the caption):\n"
-    "/upload Series | Name | Rarity | Sub-rarity\n"
+    "/upload Series | Character name | Rarity | Sub-rarity\n"
+    "The SERIES comes first, then the CHARACTER NAME. Example: /upload Re:Zero | Rem | 4 | -\n"
     "Rarity: name or number 1-9. Sub-rarity: name or - for none."
 )
+
+# Upload preview state: token -> dict. In memory, cleared on restart.
+UPLOADS: dict[str, dict] = {}
+_upl_counter = 0
+
+
+async def analyse(st: dict) -> dict:
+    """Check the typed series / name against what already exists. Nothing is changed silently any more:
+    - a series with the same letters (Re-Zero = Re:Zero = re zero) or a similar one (typo, longer title) is
+      listed in st["similar"] and the uploader decides: use the existing one or keep their own;
+    - name and series that look swapped (the name is an existing series, or the series is an existing name)."""
+    cat = await series_catalog()
+    k = series_key(st["series"])
+    existing = cat.get(k)
+    st["matched"] = bool(existing) and st["series"] == existing["name"]
+    similar: list[str] = []
+    if existing and not st["matched"]:
+        similar.append(existing["name"])
+    if not existing:
+        similar += series_close(k, cat)
+    if st.get("keep") == k:                              # the uploader chose to keep their own spelling
+        similar = []
+    st["similar"] = similar
+    nkeys = {series_key(n) for n in await db.all_char_names()}
+    nk = series_key(st["name"])
+    name_is_series = nk in cat
+    series_known = bool(existing) or bool(similar)
+    series_is_name = k in nkeys
+    st["swap"] = (name_is_series and not series_known) or (series_is_name and not existing and not name_is_series)
+    return st
+
+
+def preview_text(st: dict) -> str:
+    tag = " (existing series)" if st["matched"] else ("" if st["similar"] else " (new series)")
+    text = (
+        "<b>Check before uploading</b>\n<blockquote>"
+        f"Series : {escape(st['series'])}{tag}\n"
+        f"Character : {escape(st['name'])}\n"
+        f"Rarity : {rarity_label(st['rarity'])}\n"
+        f"Sub-rarity : {sub_label(st['sub'])}</blockquote>"
+    )
+    if st["similar"]:
+        text += "\n\n<b>A similar series is already in the database.</b>\n<blockquote>"
+        text += "\n".join(f"Series : {escape(n)}" for n in st["similar"])
+        text += f"\nYour series : {escape(st['series'])}</blockquote>\nWanna change?"
+    if st["swap"]:
+        text += ("\n\n<b>Series and character name look swapped.</b> Series comes first, then the character. "
+                 "Press Swap if they are the wrong way round.")
+    return text
+
+
+def preview_kb(tok: str, st: dict, styled: bool = True) -> InlineKeyboardMarkup:
+    b = lambda t, a, s=None: _b(t, f"up:{tok}:{a}", s, styled)
+    rows = []
+    for i, name in enumerate(st["similar"]):
+        rows.append([b(f"Use: {name[:40]}", f"us{i}", "primary")])
+    if st["similar"]:
+        rows.append([b("Keep mine", "kp")])
+    else:
+        rows.append([b("Upload", "ok", "success")])
+    rows.append([b("Swap series and name", "sw", "primary" if st["swap"] else None)])
+    rows.append([b("Cancel", "no", "danger")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(Command("upload"))
 async def upload_cmd(m: Message, command: CommandObject):
+    global _upl_counter
     u = m.from_user
     if not await allowed(u.id if u else None):
         return
@@ -252,17 +391,115 @@ async def upload_cmd(m: Message, command: CommandObject):
         return await notice(m, "Sub-rarity not allowed", sub_rule_text(rarity))
 
     kind, file_id = found
-    cid = await db.add_character(name, series, "waifu", rarity, sub, file_id, u.id, u.first_name, kind)
-    c = await db.get_character(cid)
+    st = await analyse({"uid": u.id, "series": series, "name": name, "rarity": rarity, "sub": sub,
+                        "kind": kind, "file_id": file_id})
+    _upl_counter += 1
+    tok = format(_upl_counter, "x")
+    UPLOADS[tok] = st
+    while len(UPLOADS) > 200:
+        UPLOADS.pop(next(iter(UPLOADS)))
+    await with_styles(lambda s: m.reply(preview_text(st), reply_markup=preview_kb(tok, st, s)))
 
+
+async def finish_upload(bot, st: dict, user) -> str:
+    cid = await db.add_character(st["name"], st["series"], "waifu", st["rarity"], st["sub"], st["file_id"],
+                                 user.id, user.first_name, st["kind"])
+    c = await db.get_character(cid)
     warn = ""
     try:
-        post = await send_media((m.bot, DB_CHAT), kind, file_id, db_caption(c), spoiler=True)
+        post = await send_media((bot, DB_CHAT), st["kind"], st["file_id"], db_caption(c), spoiler=True)
         await db.update_character(cid, db_msg_id=post.message_id)
     except Exception as e:
         log.warning("post to %s failed: %s", DB_CHAT, e)
-        warn = f" Could not post to {DB_CHAT}, make the bot admin there."
-    await notice(m, "Uploaded", f"ID {cid} · {name} · {rarity_label(rarity)} · {sub_label(sub)}.{warn}")
+        warn = f"\nCould not post to {DB_CHAT}, make the bot admin there."
+    return (f"<b>Uploaded</b>\nID {cid} · {escape(st['name'])}\nSeries : {escape(st['series'])}\n"
+            f"{rarity_label(st['rarity'])} · {sub_label(st['sub'])}{warn}")
+
+
+@router.callback_query(F.data.startswith("up:"))
+async def upload_cb(call: CallbackQuery):
+    p = (call.data or "").split(":")
+    if len(p) != 3 or not call.message:
+        return await call.answer()
+    tok, act = p[1], p[2]
+    st = UPLOADS.get(tok)
+    if not st:
+        return await call.answer("This upload expired, send /upload again.", show_alert=True)
+    if call.from_user.id != st["uid"]:
+        return await call.answer("Only the person who started this upload can use these buttons.", show_alert=True)
+    msg = call.message
+
+    if act == "no":
+        UPLOADS.pop(tok, None)
+        await msg.edit_text("<b>Upload cancelled</b>")
+        return await call.answer()
+    if act == "ok":
+        if st.get("similar"):
+            return await call.answer("Choose the existing series or press Keep mine first.", show_alert=True)
+        if UPLOADS.pop(tok, None) is None:               # double tap
+            return await call.answer()
+        try:
+            text = await finish_upload(call.bot, st, call.from_user)
+        except Exception:
+            log.exception("upload failed")
+            UPLOADS[tok] = st
+            return await call.answer("Upload failed, try again.", show_alert=True)
+        await msg.edit_text(text)
+        return await call.answer("Uploaded")
+    if act == "sw":
+        st["series"], st["name"] = st["name"], st["series"]
+    elif act.startswith("us") and act[2:].isdigit() and int(act[2:]) < len(st["similar"]):
+        st["series"] = st["similar"][int(act[2:])]
+    elif act == "kp":
+        st["keep"] = series_key(st["series"])
+    else:
+        return await call.answer()
+    await analyse(st)
+    try:
+        await with_styles(lambda s: msg.edit_text(preview_text(st), reply_markup=preview_kb(tok, st, s)))
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+    await call.answer()
+
+
+# ───────────── duplicate series tools ─────────────
+@router.message(Command("dupes"))
+async def dupes_cmd(m: Message):
+    if not await allowed(m.from_user.id if m.from_user else None):
+        return
+    groups = series_clusters(await series_catalog())
+    if not groups:
+        return await notice(m, "Series", "No duplicate or similar series found.")
+    lines = []
+    for g in groups[:15]:
+        lines.append(" = ".join(f"{escape(s)} ({n})" for s, n in g[:4]))
+    await m.reply("<b>Series that look the same</b>\n<blockquote expandable>" + "\n".join(lines) +
+                  "</blockquote>\nFix one with /mergeseries Wrong name | Right name")
+
+
+@router.message(Command("mergeseries"), F.from_user.id.in_(TOP))
+async def mergeseries_cmd(m: Message, command: CommandObject):
+    """/mergeseries Old | New : every character whose series is Old (any spelling of it) gets the series New."""
+    parts = [x.strip() for x in (command.args or "").split("|")]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return await notice(m, "Usage", "/mergeseries Wrong series | Right series")
+    old, new = parts
+    cat = await series_catalog()
+    entry = cat.get(series_key(old))
+    if not entry:
+        return await notice(m, "Not found", f"No series called {old}.")
+    target = cat.get(series_key(new))
+    new = target["name"] if target else new          # reuse the existing spelling when the target exists
+    ids = await db.rename_series(list(entry["spellings"]), new)
+    if not ids:
+        return await notice(m, "Nothing to change", "Those characters already use that series name.")
+    await notice(m, "Series merged", f"{len(ids)} characters moved to {new}. Database posts are updating.")
+    for cid in ids:                                   # keep the posts in the database group in line
+        c = await db.get_character(cid)
+        if c:
+            await sync_db_post(m.bot, c)
+        await asyncio.sleep(0.5)
 
 
 # ───────────── /botsadmins (owner only, rich, HTML fallback) ─────────────
@@ -628,6 +865,14 @@ async def pending_input(m: Message):
         if not m.text or not m.text.strip():
             return await notice(m, "Text needed", f"Send the new {FIELD_LABEL[field]}, or /cancel.")
         value = m.text.strip()
+        if field == "anime":                          # reuse the spelling that already exists (no duplicate series)
+            cat = await series_catalog()
+            k = series_key(value)
+            if k in cat:
+                value = cat[k]["name"]
+            elif series_close(k, cat):
+                await notice(m, "Similar series exists", ", ".join(series_close(k, cat))
+                             + ". If it is the same one, set the series again with that exact spelling.")
     PENDING.pop(m.from_user.id, None)
 
     c = await db.get_character(cid)
