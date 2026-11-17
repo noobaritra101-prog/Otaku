@@ -986,11 +986,10 @@ async def binds_cb(call: CallbackQuery):
     rows = await db.top_holders(c["char_id"], 10)
     cap = caption(c, None, rows, call.from_user)
     try:
-        if call.inline_message_id:
-            await with_styles(lambda s: call.bot.edit_message_caption(
-                inline_message_id=call.inline_message_id, caption=cap, reply_markup=binds_kb(c, s)))
+        if call.inline_message_id:                       # no reply_markup: the button is removed
+            await call.bot.edit_message_caption(inline_message_id=call.inline_message_id, caption=cap)
         elif call.message:
-            await with_styles(lambda s: call.message.edit_caption(caption=cap, reply_markup=binds_kb(c, s)))
+            await call.message.edit_caption(caption=cap, reply_markup=None)
         else:
             return await call.answer(holders_text(c, rows), show_alert=True)
     except TelegramBadRequest as e:

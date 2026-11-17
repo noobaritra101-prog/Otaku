@@ -284,15 +284,15 @@ async def card_view(c) -> tuple[str, str]:
     rows.append(("ID", str(c["char_id"])))
     rows.append(("Owned by", f"{owners} player{'s' if owners != 1 else ''} · {copies} cop{'ies' if copies != 1 else 'y'}"))
 
-    md = f"# {esc(cut(c['name'], 60))}\n\n---\n\n" + "\n>\n".join(f"> {k} : {esc(v)}" for k, v in rows)
-    html = f"<b>{escape(cut(c['name'], 60))}</b>\n<blockquote>" + "\n".join(f"{k}: {escape(v)}" for k, v in rows) + "</blockquote>"
+    md = f"# {esc(cut(c['name'], 60))}\n\n---\n\n" + "\n\n".join(f"**{k} :** {esc(v)}" for k, v in rows)
+    html = f"<b>{escape(cut(c['name'], 60))}</b>\n" + "\n".join(f"<b>{k} :</b> {escape(v)}" for k, v in rows)
     if holders:
         def who(h):
             return cut(h["first_name"] or (f"@{h['username']}" if h["username"] else str(h["user_id"])), 20)
-        md += "\n\n###### Top collectors\n\n" + "\n".join(
-            f"> {i}. **{esc(who(h))}** - x{h['qty']}" for i, h in enumerate(holders, 1))
-        html += "\n<b>Top collectors</b>\n<blockquote>" + "\n".join(
-            f"{i}. <b>{escape(who(h))}</b> - x{h['qty']}" for i, h in enumerate(holders, 1)) + "</blockquote>"
+        md += "\n\n---\n\n###### Top collectors\n\n" + "\n".join(
+            f"{i}. **{esc(who(h))}** - x{h['qty']}" for i, h in enumerate(holders, 1))
+        html += "\n\n<b>Top collectors</b>\n" + "\n".join(
+            f"{i}. <b>{escape(who(h))}</b> - x{h['qty']}" for i, h in enumerate(holders, 1))
     return md, html
 
 
@@ -327,8 +327,8 @@ async def search_view(uid: int, tok: str, query: str, page: int):
     shown = cut(query, 30)
     md = (f"# Search : =={esc(shown)}==\n\n{total} result{'s' if total != 1 else ''}\n\n---\n\n"
           + "\n".join(lines_md) + f"\n\n---\n\n###### Page {page + 1}/{pages}")
-    html = (f"<b>Search : {escape(shown)}</b>\n{total} result{'s' if total != 1 else ''}\n<blockquote expandable>"
-            + "\n".join(lines_h) + f"</blockquote>\nPage {page + 1}/{pages}")
+    html = (f"<b>Search : {escape(shown)}</b>\n{total} result{'s' if total != 1 else ''}\n"
+            + "\n".join(lines_h) + f"\nPage {page + 1}/{pages}")
 
     def kb(styled: bool = True) -> InlineKeyboardMarkup:
         nums = [btn(str(i), f"sp:{uid}:{tok}:{c['char_id']}", None, styled)
