@@ -868,3 +868,20 @@ async def rename_series(old_spellings: list[str], new: str) -> list[int]:
         await _db.execute(f"UPDATE characters SET anime=? WHERE anime IN ({marks})", (new, *old_spellings))
         await _db.commit()
     return ids
+
+
+# ---------- website API (webapi.py) ----------
+async def owner_cards(user_id: int):
+    """Every character a user owns: char_id, name, anime, rarity, sub_rarity, media_type, qty."""
+    async with _db.execute(
+        "SELECT c.char_id, c.name, c.anime, c.rarity, c.sub_rarity, c.media_type, col.qty "
+        "FROM collection col JOIN characters c ON c.char_id = col.char_id WHERE col.user_id = ?", (user_id,)) as cur:
+        return await cur.fetchall()
+
+
+async def owner_card(user_id: int, char_id: int):
+    """The character row, only when the user owns it (used for the website picture proxy)."""
+    async with _db.execute(
+        "SELECT c.* FROM collection col JOIN characters c ON c.char_id = col.char_id "
+        "WHERE col.user_id = ? AND col.char_id = ?", (user_id, char_id)) as cur:
+        return await cur.fetchone()
