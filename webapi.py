@@ -13,10 +13,13 @@ Port: the PORT environment variable (Railway sets it), default 8080. Everything 
 """
 import hmac
 import hashlib
+import asyncio
 import io
 import json
 import logging
+import math
 import os
+import secrets
 import time
 from collections import OrderedDict
 from urllib.parse import parse_qsl
@@ -58,14 +61,19 @@ async def cors(request: web.Request, handler):
         return web.Response(status=204, headers=CORS_HEADERS)
     try:
         resp = await handler(request)
+    except ApiError as e:
+        resp = web.json_response({"error": e.msg}, status=e.status)
     except web.HTTPException as e:
         resp = e
+    except Exception:
+        log.exception("web handler failed: %s", request.path)
+        resp = web.json_response({"error": "Something went wrong."}, status=500)
     resp.headers.update(CORS_HEADERS)
     return resp
 
 
-def tg_user_id(request: web.Request) -> int | None:
-    """Validate Telegram WebApp initData (X-Init-Data header) and return the user's id, else None."""
+def tg_user(request: web.Request) -> dict | None:
+    """Validate Telegram WebApp initData (X-Init-Data header) and return the Telegram user dict, else None."""
     raw = request.headers.get("X-Init-Data", "")
     if not raw:
         return None
@@ -79,7 +87,7 @@ def tg_user_id(request: web.Request) -> int | None:
             return None
         if time.time() - int(data.get("auth_date", "0")) > 86400:
             return None
-        return int(json.loads(data["user"])["id"])
+        return json.loads(data["user"])
     except Exception:
         return None
 
@@ -126,15 +134,33 @@ async def collection(request: web.Request):
     return web.json_response({"owner": await db.get_user_name(OWNER_ID) or "Owner", "cards": cards})
 
 
-def _need_user(request: web.Request) -> int:
-    uid = tg_user_id(request)
-    if uid is None:
+async def _need_user(request: web.Request) -> int:
+    u = tg_user(request)
+    if not u:
         raise web.HTTPUnauthorized(text=json.dumps({"error": "Open this from the bot."}), content_type="application/json")
+    uid = int(u["id"])
+    try:
+        await db.upsert_user(uid, u.get("username"), u.get("first_name") or "Player")
+    except Exception:
+        log.exception("upsert_user failed")
     return uid
 
 
+async def _body(request: web.Request) -> dict:
+    try:
+        d = await request.json()
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, msg: str):
+        self.status, self.msg = status, msg
+
+
 async def my_collection(request: web.Request):
-    uid = _need_user(request)
+    uid = await _need_user(request)
     rows = await db.owner_cards(uid)
     cards = [[r["char_id"], r["name"], r["anime"], r["rarity"], r["sub_rarity"] or "", r["qty"],
               KIND.get(r["media_type"], "p")] for r in rows]
@@ -142,7 +168,7 @@ async def my_collection(request: web.Request):
 
 
 async def me(request: web.Request):
-    uid = _need_user(request)
+    uid = await _need_user(request)
     return web.json_response({"nex": await db.get_nex(uid)})
 
 
@@ -184,6 +210,197 @@ async def logo(request: web.Request):
     return web.Response(body=_logo[0], content_type=_logo[1].split(";")[0], headers={"Cache-Control": "public, max-age=86400"})
 
 
+# ───────────── shop ─────────────
+def _shop_item(r) -> dict:
+    return {"id": r["char_id"], "name": r["name"], "series": r["anime"], "rarity": r["rarity"],
+            "sub": r["sub_rarity"] or "", "price": r["price"], "bought": bool(r["bought"]),
+            "m": KIND.get(r["media_type"], "p")}
+
+
+async def shop_list(request: web.Request):
+    uid = await _need_user(request)
+    import shop as shop_mod                      # lazy: shop.py pulls in the whole bot
+    day, sunday, secs = shop_mod.shop_clock()
+    await shop_mod.ensure_stock(day, sunday, uid)
+    items = await db.shop_items(day, uid)
+    return web.json_response({"items": [_shop_item(r) for r in items], "secs": secs, "sunday": sunday,
+                              "balance": await db.get_nex(uid)})
+
+
+async def shop_buy(request: web.Request):
+    uid = await _need_user(request)
+    try:
+        cid = int((await _body(request)).get("id"))
+    except (TypeError, ValueError):
+        raise ApiError(400, "Bad request.")
+    import shop as shop_mod
+    day, sunday, secs = shop_mod.shop_clock()
+    await shop_mod.ensure_stock(day, sunday, uid)
+    item = await db.shop_item(day, uid, cid)
+    st, bal = await db.shop_buy(uid, day, cid)
+    price = item["price"] if item else 0
+    msg = {"ok": "Purchased.", "gone": "This card is no longer in your shop.",
+           "limit": "You already bought this one today.",
+           "poor": f"Not enough {CURRENCY_NAME}. You have {bal:,}, you need {price:,}."}.get(st, "Could not buy this card.")
+    return web.json_response({"status": st, "balance": bal, "message": msg})
+
+
+# ───────────── mines (the web version of /mines; the hidden board never leaves the server) ─────────────
+_mlocks: dict[int, asyncio.Lock] = {}
+
+
+def _mkey(uid: int) -> str:
+    return f"webmines:{uid}"
+
+
+def mines_mult(n: int, k: int) -> float:
+    """Same formula as minigame.mines_mult: multiplier after k safe tiles with n mines (1.0 before the first tile)."""
+    if k <= 0:
+        return 1.0
+    p = math.comb(25 - n, k) / math.comb(25, k)
+    return math.floor(MINES_RTP / p * 100) / 100
+
+
+def _busy_map() -> dict:
+    """minigame's one-game-per-user map, shared so /mines in a chat and the web game exclude each other."""
+    try:
+        import minigame
+        return minigame._mines_by_user
+    except Exception:
+        return _local_busy
+
+
+_local_busy: dict[int, str] = {}
+
+
+def _mgame(g: dict) -> dict:
+    k, n = len(g["picked"]), g["mines"]
+    mult = mines_mult(n, k)
+    return {"bet": g["bet"], "mines": n, "picked": g["picked"], "mult": mult, "value": int(g["bet"] * mult),
+            "next": mines_mult(n, k + 1) if k + 1 <= 25 - n else 0, "minCashout": MINES_MIN_CASHOUT}
+
+
+async def _mload(uid: int) -> dict | None:
+    raw = await db.get_setting(_mkey(uid))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+async def _msave(uid: int, g: dict | None) -> None:
+    await db.set_setting(_mkey(uid), json.dumps(g) if g else "")
+
+
+async def _mend(uid: int, g: dict, result: str, hit: int | None = None) -> dict:
+    """Finish a game: pay out (cash / clear / timeout), reveal the mines, forget the game."""
+    k = len(g["picked"])
+    mult = mines_mult(g["mines"], k)
+    if result == "boom":
+        payout = 0
+    elif result == "timeout" and k < MINES_MIN_CASHOUT:
+        payout = g["bet"]                       # idle before cash out unlocked: bet returned (same as /mines)
+    else:
+        payout = int(g["bet"] * mult)
+    async with db.nex_lock:
+        await _msave(uid, None)
+        _busy_map().pop(uid, None)
+        bal = await db.add_nex(uid, payout) if payout else await db.get_nex(uid)
+    return {"over": True, "result": result, "bet": g["bet"], "payout": payout, "mult": mult,
+            "picked": g["picked"], "mines": g["board"], "hit": hit, "balance": bal}
+
+
+async def _mcurrent(uid: int) -> tuple[dict | None, dict | None]:
+    """(running game, result if it just timed out)."""
+    g = await _mload(uid)
+    if g and time.time() - g["t"] > MINES_TIMEOUT:
+        return None, await _mend(uid, g, "timeout")
+    return g, None
+
+
+async def mines_state(request: web.Request):
+    uid = await _need_user(request)
+    async with _mlocks.setdefault(uid, asyncio.Lock()):
+        g, ended = await _mcurrent(uid)
+        out = {"balance": await db.get_nex(uid)}
+        busy = _busy_map().get(uid)
+        if ended:
+            out["ended"] = ended
+        elif g:
+            _busy_map()[uid] = busy or "web"
+            out["game"] = _mgame(g)
+        elif busy:
+            out["busyInChat"] = True
+        return web.json_response(out)
+
+
+async def mines_start(request: web.Request):
+    uid = await _need_user(request)
+    d = await _body(request)
+    try:
+        bet, n = int(d.get("bet")), int(d.get("mines"))
+    except (TypeError, ValueError):
+        raise ApiError(400, "Bad request.")
+    if not MINES_MIN_BET <= bet <= MINES_MAX_BET:
+        raise ApiError(400, f"Bet must be {MINES_MIN_BET:,} to {MINES_MAX_BET:,} Nex.")
+    if not 1 <= n <= 24:
+        raise ApiError(400, "Mines must be 1 to 24.")
+    async with _mlocks.setdefault(uid, asyncio.Lock()):
+        g, _ = await _mcurrent(uid)
+        if g:
+            raise ApiError(409, "You already have a game running.")
+        async with db.nex_lock:
+            if uid in _busy_map():
+                raise ApiError(409, "Finish your /mines game in the chat first.")
+            if await db.get_nex(uid) < bet:
+                raise ApiError(400, "Not enough Nex.")
+            bal = await db.add_nex(uid, -bet)
+            _busy_map()[uid] = "web"
+            board = secrets.SystemRandom().sample(range(25), n)
+            g = {"bet": bet, "mines": n, "board": board, "picked": [], "t": time.time()}
+            await _msave(uid, g)
+        return web.json_response({"game": _mgame(g), "balance": bal})
+
+
+async def mines_open(request: web.Request):
+    uid = await _need_user(request)
+    try:
+        i = int((await _body(request)).get("i"))
+    except (TypeError, ValueError):
+        raise ApiError(400, "Bad request.")
+    async with _mlocks.setdefault(uid, asyncio.Lock()):
+        g, ended = await _mcurrent(uid)
+        if ended:
+            return web.json_response(ended)
+        if not g:
+            raise ApiError(404, "No game running.")
+        if not 0 <= i < 25 or i in g["picked"]:
+            raise ApiError(400, "Pick a closed tile.")
+        if i in g["board"]:
+            return web.json_response(await _mend(uid, g, "boom", hit=i))
+        g["picked"].append(i)
+        g["t"] = time.time()
+        if len(g["picked"]) >= 25 - g["mines"]:
+            return web.json_response(await _mend(uid, g, "clear"))
+        await _msave(uid, g)
+        return web.json_response({"game": _mgame(g), "balance": await db.get_nex(uid)})
+
+
+async def mines_cash(request: web.Request):
+    uid = await _need_user(request)
+    async with _mlocks.setdefault(uid, asyncio.Lock()):
+        g, ended = await _mcurrent(uid)
+        if ended:
+            return web.json_response(ended)
+        if not g:
+            raise ApiError(404, "No game running.")
+        if len(g["picked"]) < MINES_MIN_CASHOUT:
+            raise ApiError(400, f"Open {MINES_MIN_CASHOUT - len(g['picked'])} more tiles first.")
+        return web.json_response(await _mend(uid, g, "cash"))
+
+
 async def start(bot) -> web.AppRunner | None:
     """Start the web server inside the bot process. Never raises: the bot must run even if the web part fails."""
     try:
@@ -193,6 +410,9 @@ async def start(bot) -> web.AppRunner | None:
             web.get("/", index), web.get("/index.html", index), web.get("/health", health),
             web.get("/logo.png", logo), web.get("/api/overview", overview), web.get("/api/collection", collection),
             web.get("/api/mycollection", my_collection), web.get("/api/me", me),
+            web.get("/api/shop", shop_list), web.post("/api/shop/buy", shop_buy),
+            web.get("/api/mines/state", mines_state), web.post("/api/mines/start", mines_start),
+            web.post("/api/mines/open", mines_open), web.post("/api/mines/cash", mines_cash),
             web.get("/api/img/{cid}", picture),
         ])
         runner = web.AppRunner(app)
