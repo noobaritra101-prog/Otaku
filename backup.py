@@ -26,6 +26,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timezone
 from html import escape
+from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -34,7 +35,6 @@ from aiogram.types import BufferedInputFile, Message
 
 from configaration import BACKUP_EVERY, BACKUP_GROUP, CO_OWNERS, DB_PATH, OWNER_ID
 import dbase as db
-from minigame import notice
 
 router = Router()
 log = logging.getLogger("otaku.backup")
@@ -43,6 +43,30 @@ CHAT = f"@{BACKUP_GROUP}"
 PREFIX = "otaku_backup_"
 _lock = asyncio.Lock()
 _restore_failed = False          # set when a restore was attempted and failed: backups are paused then
+_tasks: set[asyncio.Task] = set()   # keeps background tasks alive until they finish
+
+
+def _fmt(title: str, text: str) -> str:
+    return f"<b>{escape(title)}</b>\n<blockquote>{escape(text)}</blockquote>"
+
+
+async def notice(m: Message, title: str, text: str) -> Message:
+    """Plain reply to the command (no rich message)."""
+    return await m.reply(_fmt(title, text))
+
+
+async def _edit(msg: Message, title: str, text: str) -> None:
+    """Edit a status message in place; send a new reply if it cannot be edited."""
+    try:
+        await msg.edit_text(_fmt(title, text))
+    except TelegramAPIError as e:
+        if "not modified" in str(e).lower():
+            return
+        log.debug("status edit failed, replying instead: %s", e)
+        try:
+            await msg.reply(_fmt(title, text))
+        except TelegramAPIError:
+            log.exception("could not report the result")
 
 
 # ───────────── snapshot / zip ─────────────
@@ -310,8 +334,9 @@ async def restore(bot) -> None:
 # ───────────── /backup (owner and co-owners): back up now ─────────────
 @router.message(Command("backup"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
 async def backup_cmd(m: Message):
+    status = await notice(m, "Backup", "Sending the backup...")
     ok, text = await run_backup(m.bot)
-    await notice(m, "Backup sent" if ok else "Backup failed", text)
+    await _edit(status, "Backup sent" if ok else "Backup failed", text)
 
 
 # ───────────── /import (owner and co-owners): load an old .db file ─────────────
@@ -329,8 +354,11 @@ def _extract_db(raw: bytes) -> bytes:
 
 
 def _check_db(path: str) -> None:
-    """Make sure the file opens, is not corrupt and looks like a bot database."""
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    """Make sure the file opens, is not corrupt and looks like a bot database.
+    Opened immutable + read only through a proper file URI: works for WAL files without their -wal, and for
+    paths with spaces or special characters."""
+    uri = Path(path).resolve().as_uri() + "?mode=ro&immutable=1"
+    con = sqlite3.connect(uri, uri=True)
     try:
         if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise ValueError("the database file is corrupt")
@@ -373,18 +401,34 @@ def _put_back() -> None:
         shutil.copy2(bak, DB_PATH)
 
 
-async def import_db(bot, doc) -> tuple[bool, str]:
-    """Replace the live database with an uploaded one and convert it. Returns (ok, text)."""
+def _err(e: Exception) -> str:
+    return f"{type(e).__name__}: {str(e)[:150]}"
+
+
+async def import_db(bot, doc, progress=None) -> tuple[bool, str]:
+    """Replace the live database with an uploaded one and convert it. Returns (ok, text).
+    `progress(text)` is awaited between the steps so the user sees what is happening."""
     global _restore_failed
+
+    async def say(t: str) -> None:
+        if progress:
+            try:
+                await progress(t)
+            except Exception:
+                pass
+
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         return False, "The file is over 20 MB, Telegram does not let bots download it."
+    await say("Downloading the file...")
     buf = io.BytesIO()
     try:
         await bot.download(doc.file_id, destination=buf)
         raw = await asyncio.to_thread(_extract_db, buf.getvalue())
     except Exception as e:
-        return False, f"Could not read the file: {str(e)[:150]}"
+        log.exception("import: could not read the file")
+        return False, f"Could not read the file. {_err(e)}"
 
+    await say("Checking the database...")
     async with _lock:                                 # no backup runs while the database is swapped
         try:
             await db.close_db()
@@ -395,7 +439,8 @@ async def import_db(bot, doc) -> tuple[bool, str]:
                 await db.init_db()                    # reopen the untouched current database
             except Exception:
                 log.exception("could not reopen the database")
-            return False, f"Nothing was changed. {str(e)[:150]}"
+            return False, f"Nothing was changed. {_err(e)}"
+        await say("Converting to the current layout...")
         try:
             await db.init_db()                        # opens it and converts the old layout
             users, chats, chars = await db.stats()
@@ -406,17 +451,35 @@ async def import_db(bot, doc) -> tuple[bool, str]:
                 await db.init_db()
             except Exception:
                 log.exception("could not reopen the previous database")
-            return False, f"Conversion failed, the previous database was put back. {str(e)[:150]}"
+            return False, f"Conversion failed, the previous database was put back. {_err(e)}"
         _restore_failed = False
-    await run_backup(bot, force=True)                 # new backup + pin right away
-    return True, f"{users} users, {chats} groups, {chars} characters. Backup sent and pinned."
+    return True, f"{users} users, {chats} groups, {chars} characters loaded."
+
+
+async def _backup_after_import(bot, msg: Message, text: str) -> None:
+    ok, info = await run_backup(bot, force=True)      # new backup + pin
+    await _edit(msg, "Database imported", text + (" Backup sent and pinned." if ok else f" Backup failed: {info}"))
 
 
 @router.message(Command("import"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
 async def import_cmd(m: Message):
-    doc = (m.document or (m.reply_to_message.document if m.reply_to_message else None))
-    if not doc:
-        return await notice(m, "Import", "Send the old .db (or backup .zip) file with /import as the caption, "
-                                         "or reply to the file with /import.")
-    ok, text = await import_db(m.bot, doc)
-    await notice(m, "Database imported" if ok else "Import failed", text)
+    status = await notice(m, "Import", "Got it, working on it...")      # instant reply
+    try:
+        doc = m.document or (m.reply_to_message.document if m.reply_to_message else None)
+        if not doc:
+            return await _edit(status, "Import", "Send the old .db (or backup .zip) file with /import as the caption, "
+                                                 "or reply to the file with /import.")
+
+        async def progress(t: str) -> None:
+            await _edit(status, "Import", t)
+
+        ok, text = await import_db(m.bot, doc, progress)
+    except Exception as e:
+        log.exception("import crashed")
+        return await _edit(status, "Import failed", _err(e))
+    if not ok:
+        return await _edit(status, "Import failed", text)
+    await _edit(status, "Database imported", text + " Sending a backup...")
+    t = asyncio.create_task(_backup_after_import(m.bot, status, text))
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
