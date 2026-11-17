@@ -1,5 +1,5 @@
 # Otaku Nexus - configuration
-BOT_TOKEN = "8607412360:AAEIX6pf3Yd9S0J5Dc_OWtk4PU-BW8aDOTg"
+BOT_TOKEN = "8607412360:AAENghDt9jOr6lQ6rJA-I44ULxN2wPqLqaY"
 BOT_NAME = "Otaku Nexus"
 BOT_USERNAME = "Otakunx_bot"
 MAIN_GROUP = "otaku_main"          # without @
