@@ -15,10 +15,11 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAnimation,
-    InputMediaPhoto, InputMediaVideo, Message,
+    BufferedInputFile, InputMediaPhoto, InputMediaVideo, Message,
 )
 
 import dbase as db
+import watermark as wm
 from configaration import OWNER_ID, CO_OWNERS, DB_GROUP, RARITIES, SUB_RARITIES, SUB_RULES, RICH_MESSAGES
 from minigame import notice
 from richmsg import edit_rich, esc, send_rich
@@ -63,6 +64,19 @@ async def send_media(target, kind: str, file_id: str, caption: str, spoiler: boo
         fn = {"video": bot.send_video, "animation": bot.send_animation}.get(kind, bot.send_photo)
         kw["chat_id"] = chat_id
     return await fn(**{kind: file_id}, caption=caption, has_spoiler=spoiler, **kw)
+
+
+async def stamped_post(bot, c, kind: str, file_id: str):
+    """Post a card to the database group. Photos get the watermark, and the watermarked
+    picture's file_id replaces the stored one so every later card shows the watermark."""
+    if kind == "photo":
+        data = await wm.stamp(bot, file_id)
+        if data:
+            post = await bot.send_photo(DB_CHAT, BufferedInputFile(data, "card.jpg"),
+                                        caption=db_caption(c), has_spoiler=True)
+            await db.update_character(c["char_id"], file_id=post.photo[-1].file_id)
+            return post
+    return await send_media((bot, DB_CHAT), kind, file_id, db_caption(c), spoiler=True)
 
 
 async def allowed(user_id: int | None) -> bool:
@@ -407,7 +421,7 @@ async def finish_upload(bot, st: dict, user) -> str:
     c = await db.get_character(cid)
     warn = ""
     try:
-        post = await send_media((bot, DB_CHAT), st["kind"], st["file_id"], db_caption(c), spoiler=True)
+        post = await stamped_post(bot, c, st["kind"], st["file_id"])
         await db.update_character(cid, db_msg_id=post.message_id)
     except Exception as e:
         log.warning("post to %s failed: %s", DB_CHAT, e)
@@ -878,6 +892,17 @@ async def pending_input(m: Message):
     c = await db.get_character(cid)
     if not c:
         return await notice(m, "Not found", "That character no longer exists.")
+    if field == "file_id" and kind == "photo" and c["db_msg_id"]:      # watermark the new picture
+        data = await wm.stamp(m.bot, value)
+        if data:
+            try:
+                res = await m.bot.edit_message_media(
+                    InputMediaPhoto(media=BufferedInputFile(data, "card.jpg"),
+                                    caption=db_caption(c), has_spoiler=True),
+                    chat_id=DB_CHAT, message_id=c["db_msg_id"])
+                value = res.photo[-1].file_id
+            except Exception as e:
+                log.warning("watermarked swap failed for %s: %s", cid, e)
     await db.update_character(cid, **{field: value}, **({"media_type": kind} if field == "file_id" else {}))
     c = await db.get_character(cid)
 
