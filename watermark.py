@@ -38,16 +38,16 @@ def _font(size: int):
 def _stamp(raw: bytes) -> bytes:
     im = Image.open(io.BytesIO(raw)).convert("RGB")
     w, h = im.size
-    font = _font(max(16, w // 14))
-    x0, y0, x1, y1 = ImageDraw.Draw(im).textbbox((0, 0), TEXT, font=font, stroke_width=2)
+    font = _font(max(12, w // 28))
+    x0, y0, x1, y1 = ImageDraw.Draw(im).textbbox((0, 0), TEXT, font=font, stroke_width=1)
     tw, th = x1 - x0, y1 - y0
-    pad = max(12, h // 40)
+    pad = max(8, h // 60)
     strip_h = min(h, th + pad + 8)                      # only the bottom strip is processed (faster)
     top = h - strip_h
     strip = im.crop((0, top, w, h)).convert("RGBA")
     layer = Image.new("RGBA", strip.size, (0, 0, 0, 0))
     ImageDraw.Draw(layer).text(((w - tw) // 2 - x0, 8 - y0), TEXT, font=font,
-                               fill=(255, 255, 255, 230), stroke_width=2, stroke_fill=(0, 0, 0, 200))
+                               fill=(255, 255, 255, 110), stroke_width=1, stroke_fill=(0, 0, 0, 90))
     im.paste(Image.alpha_composite(strip, layer).convert("RGB"), (0, top))
     out = io.BytesIO()
     im.save(out, "JPEG", quality=90)
