@@ -9,6 +9,9 @@
 - Startup restore compares the last_backup_at marker stored inside the local database with the backup's time
   (not file times); an empty local database always restores. Message ids of sent backups are saved in the
   database so old files are still deleted after a restart. An empty database never overwrites a pinned backup.
+- Every Telegram call is retried with a back-off on timeouts / network / 5xx / flood errors, and downloads get a
+  long timeout, so a slow network at startup no longer fails the restore. If the restore still fails, the backup
+  loop keeps retrying it in the background (when the local database is empty) and resumes backups by itself.
 - The bot must be admin in the backup group with the Pin messages and Delete messages rights.
 - Telegram limits: bots can download files up to 20 MB and upload up to 50 MB.
 - /import (owner and co-owners): send an old .db (or a backup .zip) as a file with /import as the caption, or
@@ -29,7 +32,7 @@ from html import escape
 from pathlib import Path
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 
@@ -46,27 +49,60 @@ _restore_failed = False          # set when a restore was attempted and failed: 
 _tasks: set[asyncio.Task] = set()   # keeps background tasks alive until they finish
 
 
+_NET = (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError, ConnectionError)
+
+
 def _fmt(title: str, text: str) -> str:
-    return f"<b>{escape(title)}</b>\n<blockquote>{escape(text)}</blockquote>"
+    return f"{title}\n{text}"
 
 
 async def notice(m: Message, title: str, text: str) -> Message:
-    """Plain HTML reply to the command."""
-    return await m.reply(_fmt(title, text))
+    """Plain text reply to the command."""
+    return await m.reply(_fmt(title, text), parse_mode=None)
 
 
 async def _edit(msg: Message, title: str, text: str) -> None:
     """Edit a status message in place; send a new reply if it cannot be edited."""
     try:
-        await msg.edit_text(_fmt(title, text))
+        await msg.edit_text(_fmt(title, text), parse_mode=None)
     except TelegramAPIError as e:
         if "not modified" in str(e).lower():
             return
         log.debug("status edit failed, replying instead: %s", e)
         try:
-            await msg.reply(_fmt(title, text))
+            await msg.reply(_fmt(title, text), parse_mode=None)
         except TelegramAPIError:
             log.exception("could not report the result")
+
+
+async def _retry(make, what: str, tries: int = 6, base: float = 4.0):
+    """await make() again after timeouts, network errors, 5xx and flood waits (back-off 4, 8, 12... s).
+    Other Telegram errors (no rights, not found...) are raised at once."""
+    for n in range(1, tries + 1):
+        try:
+            return await make()
+        except TelegramRetryAfter as e:
+            if n == tries:
+                raise
+            wait = min(float(e.retry_after) + 1, 60)
+        except _NET as e:
+            if n == tries:
+                raise
+            wait = base * n
+            log.warning("%s failed (%s), retry %d/%d in %.0fs", what, e, n, tries - 1, wait)
+            await asyncio.sleep(wait)
+            continue
+        log.warning("%s: flood wait, retry %d/%d in %.0fs", what, n, tries - 1, wait)
+        await asyncio.sleep(wait)
+
+
+async def _download(bot, file_id: str) -> bytes:
+    """Download a Telegram file with a long timeout and retries (aiogram's default is only 30 s)."""
+    async def once() -> bytes:
+        buf = io.BytesIO()
+        await asyncio.wait_for(bot.download(file_id, destination=buf, timeout=180), timeout=240)
+        return buf.getvalue()
+    return await _retry(once, "download")
 
 
 # ───────────── snapshot / zip ─────────────
@@ -100,7 +136,7 @@ def _is_backup(msg: Message | None) -> bool:
 
 
 async def _pinned(bot) -> Message | None:
-    return (await bot.get_chat(CHAT)).pinned_message
+    return (await _retry(lambda: bot.get_chat(CHAT), "read pinned message")).pinned_message
 
 
 # ───────────── local database helpers (blocking, used before the async db is open too) ─────────────
@@ -151,46 +187,51 @@ async def _save_ids() -> None:
 
 
 async def _drop_old(bot, ids: set[int]) -> list[str]:
-    """Unpin and delete old backup messages. Returns problems; whatever cannot be deleted stays in _sent_ids."""
+    """Delete old backup messages (deleting a pinned message unpins it). Returns problems; whatever cannot be
+    deleted stays in _sent_ids and is retried next cycle. If a delete fails the message is at least unpinned."""
     problems: list[str] = []
     for mid in sorted(ids):
         try:
-            await bot.unpin_chat_message(chat_id=CHAT, message_id=mid)
+            await _retry(lambda: bot.delete_message(chat_id=CHAT, message_id=mid), f"delete {mid}", tries=4)
         except TelegramAPIError as e:
-            log.debug("unpin old backup %s: %s", mid, e)      # already unpinned / gone is fine
-        try:
-            await bot.delete_message(chat_id=CHAT, message_id=mid)
-        except TelegramAPIError as e:
-            if "not found" in str(e).lower():                 # already deleted
+            low = str(e).lower()
+            if "not found" in low or "message_id_invalid" in low:      # already gone
                 if mid in _sent_ids:
                     _sent_ids.remove(mid)
-            else:
-                log.warning("delete old backup %s failed, will retry next cycle: %s", mid, e)
-                problems.append(f"could not delete {mid}: {str(e)[:80]}")
+                continue
+            log.warning("delete old backup %s failed, will retry next cycle: %s", mid, e)
+            problems.append(f"could not delete {mid}: {str(e)[:80]}")
+            try:                                                       # at least do not leave it pinned
+                await _retry(lambda: bot.unpin_chat_message(chat_id=CHAT, message_id=mid), f"unpin {mid}", tries=3)
+            except TelegramAPIError as e2:
+                log.debug("unpin old backup %s: %s", mid, e2)
             continue
         if mid in _sent_ids:
             _sent_ids.remove(mid)
+        await asyncio.sleep(0.4)                                       # stay clear of flood limits
     return problems
 
 
 async def run_backup(bot, force: bool = False) -> tuple[bool, str]:
     """One backup cycle. Returns (ok, text).
 
-    Send the new zip, make it the ONLY pinned message (unpin_all, then pin), then unpin + delete every older backup:
+    Send the new zip, make it the ONLY pinned message (unpin_all, then pin), then delete every older backup:
     the pinned one, every id saved in the database (survives restarts) and every one sent by this process.
     A backup of an EMPTY database is refused while a backup is pinned (force=True skips that check)."""
     if _restore_failed:
-        return False, "Backup paused: the startup restore failed, fix it and restart."
+        return False, "Backup paused: the startup restore failed, it is retried in the background."
     async with _lock:
         sent = None
         try:
+            prev, prev_known = None, True
             try:
                 prev = await _pinned(bot)
             except TelegramAPIError as e:
                 log.warning("could not read the pinned message: %s", e)
-                prev = None
-            if not force and _is_backup(prev) and await asyncio.to_thread(_local_is_empty):
-                return False, "The database is empty but a backup is pinned. Not overwriting it. Restart the bot to restore, or /import."
+                prev_known = False
+            if not force and await asyncio.to_thread(_local_is_empty) and (_is_backup(prev) or not prev_known):
+                return False, ("The database is empty but a backup may be pinned. Not overwriting it. "
+                               "Restart the bot to restore, or /import.")
             for i in _ids_of(await db.get_setting("backup_msg_ids")):
                 if i not in _sent_ids:
                     _sent_ids.append(i)
@@ -199,22 +240,30 @@ async def run_backup(bot, force: bool = False) -> tuple[bool, str]:
             data, name = await asyncio.to_thread(_snapshot_zip)
             sent = await bot.send_document(
                 CHAT, BufferedInputFile(data, filename=name),
-                caption=f"<b>Database backup</b>\n{ts.strftime('%Y-%m-%d %H:%M:%S UTC')} · {len(data) / 1024:.0f} KB",
-                disable_notification=True)
+                caption=f"Database backup\n{ts.strftime('%Y-%m-%d %H:%M:%S UTC')} · {len(data) / 1024:.0f} KB",
+                parse_mode=None, disable_notification=True, request_timeout=300)
+            _sent_ids.append(sent.message_id)
+            await _save_ids()                                   # saved at once: a crash now still leaves it known
             try:
-                await bot.unpin_all_chat_messages(chat_id=CHAT)     # nothing old stays pinned, even a stale pin
+                await _retry(lambda: bot.unpin_all_chat_messages(chat_id=CHAT), "unpin all")
             except TelegramAPIError as e:
                 log.warning("unpin all failed: %s", e)
             try:
-                await bot.pin_chat_message(chat_id=CHAT, message_id=sent.message_id, disable_notification=True)
+                await _retry(lambda: bot.pin_chat_message(chat_id=CHAT, message_id=sent.message_id,
+                                                          disable_notification=True), "pin")
+            except _NET as e:
+                # the pin may or may not have gone through: keep the new file, old ones are cleaned next cycle
+                log.warning("pin result unknown after retries: %s", e)
+                return False, "Backup sent but pinning timed out, old backups are kept and cleaned next cycle."
             except Exception:
                 # unpinned new backups would never be found at startup: remove it, keep the old pin
                 try:
                     await bot.delete_message(chat_id=CHAT, message_id=sent.message_id)
-                except TelegramAPIError:
+                    _sent_ids.remove(sent.message_id)
+                    await _save_ids()
+                except (TelegramAPIError, ValueError):
                     pass
                 raise
-            _sent_ids.append(sent.message_id)
             old = {i for i in _sent_ids if i != sent.message_id}
             if _is_backup(prev) and prev.message_id != sent.message_id:
                 old.add(prev.message_id)
@@ -237,9 +286,21 @@ async def run_backup(bot, force: bool = False) -> tuple[bool, str]:
 
 
 async def backup_loop(bot) -> None:
-    """Back up right away, then every BACKUP_EVERY seconds."""
+    """Back up right away, then every BACKUP_EVERY seconds. While a startup restore is marked failed, retry the
+    restore every 90 s instead; backups resume as soon as it works."""
     while True:
-        await run_backup(bot)
+        if _restore_failed:
+            try:
+                await _late_restore(bot)
+            except Exception as e:
+                log.warning("restore retry failed: %s", e)
+            if _restore_failed:
+                await asyncio.sleep(90)
+                continue
+        try:
+            await run_backup(bot)
+        except Exception:
+            log.exception("backup cycle crashed")
         await asyncio.sleep(BACKUP_EVERY)
 
 
@@ -270,23 +331,29 @@ def _write_db(zip_bytes: bytes) -> None:
 
 async def _tell_owner(bot, text: str) -> None:
     try:
-        await bot.send_message(OWNER_ID, text)
-    except TelegramAPIError as e:
+        await _retry(lambda: bot.send_message(OWNER_ID, text, parse_mode=None), "message the owner", tries=3)
+    except (TelegramAPIError, asyncio.TimeoutError) as e:
         log.warning("could not message the owner: %s", e)
 
 
 async def _find_backup(bot) -> Message | None:
     """The newest backup message: the pinned one, else the last ids saved in the local database (forwarded to
-    the owner to read their file id, the forward is deleted again)."""
+    the owner to read their file id, the forward is deleted again). Network failures (after retries) are raised,
+    never treated as 'no backup'."""
     try:
         pin = await _pinned(bot)
         if _is_backup(pin):
             return pin
+    except _NET:
+        raise
     except TelegramAPIError as e:
         log.warning("restore: could not read the pinned message: %s", e)
     for mid in reversed(_ids_of(await asyncio.to_thread(_local_get, "backup_msg_ids"))):
         try:
-            fwd = await bot.forward_message(chat_id=OWNER_ID, from_chat_id=CHAT, message_id=mid)
+            fwd = await _retry(lambda: bot.forward_message(chat_id=OWNER_ID, from_chat_id=CHAT, message_id=mid),
+                               f"forward {mid}", tries=3)
+        except _NET:
+            raise
         except TelegramAPIError:
             continue
         try:
@@ -298,9 +365,14 @@ async def _find_backup(bot) -> Message | None:
     return None
 
 
+def _remote_ts(msg: Message) -> int:
+    return int(msg.forward_date.timestamp()) if msg.forward_date else int(msg.date.timestamp())
+
+
 async def restore(bot) -> None:
     """Call BEFORE db.init_db(). Loads the newest backup from the group unless the local database is already
-    at least as new (decided by the last_backup_at marker stored INSIDE the database, not by file times)."""
+    at least as new (decided by the last_backup_at marker stored INSIDE the database, not by file times).
+    Network problems are retried; if it still fails, backups stay paused and backup_loop retries later."""
     global _restore_failed
     try:
         msg = await _find_backup(bot)
@@ -308,27 +380,55 @@ async def restore(bot) -> None:
             log.info("restore: no backup found in %s, starting with the local database", CHAT)
             if _local_is_empty():
                 await _tell_owner(
-                    bot, "<b>No backup found</b>\n<blockquote>No pinned backup in "
+                    bot, "No backup found\nNo pinned backup in "
                     f"{CHAT} and the database is empty. Send your old .db file with /import as the caption "
-                    "to load it.</blockquote>")
+                    "to load it.")
             return
-        remote_ts = int(msg.forward_date.timestamp()) if msg.forward_date else int(msg.date.timestamp())
+        remote_ts = _remote_ts(msg)
         local_ts = int(_local_get("last_backup_at") or 0)
         if not _local_is_empty() and local_ts >= remote_ts - 120:
             log.info("restore: local database (marker %s) is as new as the backup (%s), keeping it", local_ts, remote_ts)
             return
-        buf = io.BytesIO()
-        await bot.download(msg.document.file_id, destination=buf)
-        await asyncio.to_thread(_write_db, buf.getvalue())
-        log.info("restore: loaded %s (%d bytes)", msg.document.file_name, len(buf.getvalue()))
-        await _tell_owner(bot, f"<b>Backup restored</b>\n<blockquote>{escape(msg.document.file_name or '')} "
-                               f"({len(buf.getvalue()) / 1024:.0f} KB) was loaded at startup.</blockquote>")
+        data = await _download(bot, msg.document.file_id)
+        await asyncio.to_thread(_write_db, data)
+        log.info("restore: loaded %s (%d bytes)", msg.document.file_name, len(data))
+        await _tell_owner(bot, f"Backup restored\n{msg.document.file_name or ''} "
+                               f"({len(data) / 1024:.0f} KB) was loaded at startup.")
     except Exception as e:
         _restore_failed = True
         log.exception("restore failed, backups paused so the good backup is not overwritten")
-        await _tell_owner(bot, "<b>Restore failed</b>\n<blockquote>" + escape(str(e)[:200]) +
-                          "\nBackups are paused so the good backup is not overwritten. Fix it and restart, "
-                          "or use /import.</blockquote>")
+        await _tell_owner(bot, "Restore failed\n" + (str(e) or type(e).__name__)[:200] +
+                          "\nBackups are paused so the good backup is not overwritten. The restore is retried "
+                          "automatically; or use /import.")
+
+
+async def _late_restore(bot) -> None:
+    """Retry a failed startup restore while the bot is running (called by backup_loop). Only an EMPTY local
+    database is replaced automatically; otherwise the owner decides with /import."""
+    global _restore_failed
+    msg = await _find_backup(bot)
+    local_empty = await asyncio.to_thread(_local_is_empty)
+    if not msg:
+        if local_empty:
+            log.info("restore retry: no backup in %s, backups resume", CHAT)
+        _restore_failed = False
+        return
+    local_ts = int(await asyncio.to_thread(_local_get, "last_backup_at") or 0)
+    if not local_empty:
+        if local_ts >= _remote_ts(msg) - 120:
+            log.info("restore retry: local database is as new as the backup, backups resume")
+            _restore_failed = False
+        else:
+            log.warning("restore retry: local database has data but is older than the backup, use /import")
+        return
+    data = await _download(bot, msg.document.file_id)
+    raw = await asyncio.to_thread(_extract_db, data)
+    async with _lock:
+        users, chats, chars = await _replace_live(raw)
+    _restore_failed = False
+    log.info("restore retry: loaded %s", msg.document.file_name)
+    await _tell_owner(bot, f"Backup restored\n{users} users, {chats} groups, {chars} characters loaded "
+                           "after the startup restore had failed.")
 
 
 # ───────────── /backup (owner and co-owners): back up now ─────────────
@@ -420,6 +520,36 @@ def _err(e: Exception) -> str:
     return f"{type(e).__name__}: {str(e)[:150]}"
 
 
+class _SwapError(Exception):
+    pass
+
+
+async def _replace_live(raw: bytes) -> tuple[int, int, int]:
+    """Swap the live database for `raw` and convert it. The caller holds _lock. Returns (users, chats, chars).
+    On failure the previous database is back in place and _SwapError says why."""
+    try:
+        await db.close_db()
+        await asyncio.to_thread(_swap_in, raw)
+    except Exception as e:
+        log.exception("swap failed before the replace")
+        try:
+            await db.init_db()                    # reopen the untouched current database
+        except Exception:
+            log.exception("could not reopen the database")
+        raise _SwapError(f"Nothing was changed. {_err(e)}") from e
+    try:
+        await db.init_db()                        # opens it and converts the old layout
+        return await db.stats()
+    except Exception as e:
+        log.exception("conversion failed, putting the previous database back")
+        await asyncio.to_thread(_put_back)
+        try:
+            await db.init_db()
+        except Exception:
+            log.exception("could not reopen the previous database")
+        raise _SwapError(f"Conversion failed, the previous database was put back. {_err(e)}") from e
+
+
 async def import_db(bot, doc, progress=None) -> tuple[bool, str]:
     """Replace the live database with an uploaded one and convert it. Returns (ok, text).
     `progress(text)` is awaited between the steps so the user sees what is happening."""
@@ -435,38 +565,18 @@ async def import_db(bot, doc, progress=None) -> tuple[bool, str]:
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         return False, "The file is over 20 MB, Telegram does not let bots download it."
     await say("Downloading the file...")
-    buf = io.BytesIO()
     try:
-        await asyncio.wait_for(bot.download(doc.file_id, destination=buf), timeout=120)
-        raw = await asyncio.to_thread(_extract_db, buf.getvalue())
+        raw = await asyncio.to_thread(_extract_db, await _download(bot, doc.file_id))
     except Exception as e:
         log.exception("import: could not read the file")
         return False, f"Could not read the file. {_err(e)}"
 
-    await say("Checking the database...")
+    await say("Checking and converting the database...")
     async with _lock:                                 # no backup runs while the database is swapped
         try:
-            await db.close_db()
-            await asyncio.to_thread(_swap_in, raw)
-        except Exception as e:
-            log.exception("import failed before the swap")
-            try:
-                await db.init_db()                    # reopen the untouched current database
-            except Exception:
-                log.exception("could not reopen the database")
-            return False, f"Nothing was changed. {_err(e)}"
-        await say("Converting to the current layout...")
-        try:
-            await db.init_db()                        # opens it and converts the old layout
-            users, chats, chars = await db.stats()
-        except Exception as e:
-            log.exception("import conversion failed, putting the previous database back")
-            await asyncio.to_thread(_put_back)
-            try:
-                await db.init_db()
-            except Exception:
-                log.exception("could not reopen the previous database")
-            return False, f"Conversion failed, the previous database was put back. {_err(e)}"
+            users, chats, chars = await _replace_live(raw)
+        except _SwapError as e:
+            return False, str(e)
         _restore_failed = False
     return True, f"{users} users, {chats} groups, {chars} characters loaded."
 
