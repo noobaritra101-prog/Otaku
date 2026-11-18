@@ -97,12 +97,21 @@ async def _retry(make, what: str, tries: int = 6, base: float = 4.0):
 
 
 async def _download(bot, file_id: str) -> bytes:
-    """Download a Telegram file with a long timeout and retries (aiogram's default is only 30 s)."""
+    """Download a Telegram file in two separately timed steps, with retries.
+
+    bot.download() first calls get_file WITHOUT a timeout of its own, so it used aiogram's 60 s session default
+    (its `timeout=` only covers the byte stream). That is what kept failing at ~60 s. Here get_file gets its own
+    request_timeout and the stream its own long timeout; the size is checked so a cut-off file is retried."""
     async def once() -> bytes:
+        f = await bot.get_file(file_id, request_timeout=120)
+        log.info("download: got file path (%s bytes), streaming...", f.file_size)
         buf = io.BytesIO()
-        await asyncio.wait_for(bot.download(file_id, destination=buf, timeout=180), timeout=240)
-        return buf.getvalue()
-    return await _retry(once, "download")
+        await asyncio.wait_for(bot.download_file(f.file_path, destination=buf, timeout=300), timeout=330)
+        data = buf.getvalue()
+        if f.file_size and len(data) != f.file_size:
+            raise ConnectionError(f"incomplete download ({len(data)} of {f.file_size} bytes)")
+        return data
+    return await _retry(once, "download", tries=8)
 
 
 # ───────────── snapshot / zip ─────────────
