@@ -68,15 +68,16 @@ async def send_media(target, kind: str, file_id: str, caption: str, spoiler: boo
 
 async def stamped_post(bot, c, kind: str, file_id: str):
     """Post a card to the database group. Photos get the watermark, and the watermarked
-    picture's file_id replaces the stored one so every later card shows the watermark."""
+    picture's file_id replaces the stored one so every later card shows the watermark.
+    Returns (post, watermarked)."""
     if kind == "photo":
         data = await wm.stamp(bot, file_id)
         if data:
             post = await bot.send_photo(DB_CHAT, BufferedInputFile(data, "card.jpg"),
                                         caption=db_caption(c), has_spoiler=True)
             await db.update_character(c["char_id"], file_id=post.photo[-1].file_id)
-            return post
-    return await send_media((bot, DB_CHAT), kind, file_id, db_caption(c), spoiler=True)
+            return post, True
+    return await send_media((bot, DB_CHAT), kind, file_id, db_caption(c), spoiler=True), False
 
 
 async def allowed(user_id: int | None) -> bool:
@@ -421,8 +422,10 @@ async def finish_upload(bot, st: dict, user) -> str:
     c = await db.get_character(cid)
     warn = ""
     try:
-        post = await stamped_post(bot, c, st["kind"], st["file_id"])
+        post, stamped = await stamped_post(bot, c, st["kind"], st["file_id"])
         await db.update_character(cid, db_msg_id=post.message_id)
+        if st["kind"] == "photo" and not stamped:
+            warn = "\nWatermark could not be added (check bot logs, watermark.ttf must be next to watermark.py)."
     except Exception as e:
         log.warning("post to %s failed: %s", DB_CHAT, e)
         warn = f"\nCould not post to {DB_CHAT}, make the bot admin there."
@@ -452,14 +455,24 @@ async def upload_cb(call: CallbackQuery):
             return await call.answer("Choose the existing series or press Keep mine first.", show_alert=True)
         if UPLOADS.pop(tok, None) is None:               # double tap
             return await call.answer()
+        await call.answer("Uploading...")                 # stops the button spinner right away
+        try:
+            await msg.edit_text("<b>Uploading...</b>")    # also removes the buttons (no double taps)
+        except TelegramBadRequest:
+            pass
         try:
             text = await finish_upload(call.bot, st, call.from_user)
         except Exception:
             log.exception("upload failed")
             UPLOADS[tok] = st
-            return await call.answer("Upload failed, try again.", show_alert=True)
+            try:
+                await with_styles(lambda s: msg.edit_text("<b>Upload failed, press Upload again.</b>\n\n" + preview_text(st),
+                                                          reply_markup=preview_kb(tok, st, s)))
+            except Exception:
+                pass
+            return
         await msg.edit_text(text)
-        return await call.answer("Uploaded")
+        return
     if act == "sw":
         st["series"], st["name"] = st["name"], st["series"]
     elif act.startswith("us") and act[2:].isdigit() and int(act[2:]) < len(st["similar"]):
