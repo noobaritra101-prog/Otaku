@@ -84,6 +84,16 @@ def char_lines(rows, owned: set[int]) -> tuple[list[str], list[str]]:
 
 
 # ═════════════ /waifuverse ═════════════
+async def series_owned(uid: int, akey, total: int) -> int:
+    """How many DIFFERENT characters of a series the user owns. Counted with the same lookup that draws the
+    checklist ticks (owned_among), so the number always matches what the list shows."""
+    if not total:
+        return 0
+    rows = await db.verse_chars_page(akey, 0, total)
+    ids = [c["char_id"] for c in rows]
+    return len(await db.owned_among(uid, ids)) if ids else 0
+
+
 async def verse_view(uid: int, view: str, page: int, idx: int = 0):
     """Returns (md, html, kb_factory)."""
     if view == "a":
@@ -94,7 +104,8 @@ async def verse_view(uid: int, view: str, page: int, idx: int = 0):
         chars = await db.verse_chars_count()
         lines_md, lines_h = [], []
         for i, r in enumerate(rows, page * ANIME_PER_PAGE + 1):
-            tail = f"{r['owned']}/{r['n']} owned"
+            have = await series_owned(uid, r["akey"], r["n"])
+            tail = f"{have}/{r['n']} owned"
             lines_md.append(f"> {i}. **{esc(cut(r['anime'], 40))}** - {tail}")
             lines_h.append(f"{i}. <b>{escape(cut(r['anime'], 40))}</b> - {tail}")
         if not lines_md:
@@ -150,7 +161,7 @@ async def series_view(uid: int, idx: int, back_page: int, page: int):
     page = min(max(page, 0), pages - 1)
     rows = await db.verse_chars_page(akey, page * CHARS_PER_PAGE, CHARS_PER_PAGE)
     owned = await db.owned_among(uid, [c["char_id"] for c in rows])
-    have = row[0]["owned"] if "owned" in row[0].keys() else 0
+    have = await series_owned(uid, akey, total)
     lines_md, lines_h = char_lines(rows, owned)
     md = (f"# Series : =={esc(cut(name, 40))}==\n\n{have}/{total} owned\n\n---\n\n"
           + "\n".join(lines_md) + f"\n\n---\n\n###### Page {page + 1}/{pages}")

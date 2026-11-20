@@ -39,6 +39,7 @@ router = Router()
 log = logging.getLogger("otaku.harem")
 
 SERIES_PER_PAGE = 5
+MINIAPP_URL = "https://t.me/Otakunx_bot/otakuapp"
 CAPTION_MAX = 1000                  # Telegram caption limit is 1024 (fallback only)
 RAR_EMO = {n: e for n, e, *_ in RARITIES}
 
@@ -118,8 +119,9 @@ async def build(target_id: int, page: int):
 
 
 def keyboard(viewer: int, target: int, st: dict, styled: bool = True) -> InlineKeyboardMarkup:
-    def b(text: str, data: str) -> InlineKeyboardButton:
-        return InlineKeyboardButton(text=text, callback_data=data)
+    def b(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
+        extra = {"style": style} if (style and styled) else {}
+        return InlineKeyboardButton(text=text, callback_data=data, **extra)
 
     page, pages = st["page"], st["pages"]
     rows = []
@@ -131,7 +133,12 @@ def keyboard(viewer: int, target: int, st: dict, styled: bool = True) -> InlineK
         if page < pages - 1:
             nav.append(b("Next", f"hm:{viewer}:{target}:{page + 1}"))
         rows.append(nav)
-    rows.append([collection_btn(target, styled)])
+    # row 2: mini app (primary) + Collection (inline view); row 3: delete (danger)
+    app = InlineKeyboardButton(text="🌐", url=MINIAPP_URL, **({"style": "primary"} if styled else {}))
+    coll = InlineKeyboardButton(text="Collection", switch_inline_query_current_chat=f"collection.{target}",
+                                **({"style": "primary"} if styled else {}))
+    rows.append([app, coll])
+    rows.append([b("🗑️", f"hm:x:{viewer}", "danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -162,6 +169,18 @@ async def harem_cmd(m: Message):
 @router.callback_query(F.data.startswith("hm:"))
 async def harem_cb(call: CallbackQuery):
     parts = call.data.split(":")
+    if len(parts) == 3 and parts[1] == "x":                 # hm:x:<viewer> = delete the harem message
+        if not parts[2].isdigit() or call.from_user.id != int(parts[2]):
+            return await call.answer("Only the person who used /harem can close this.", show_alert=True)
+        try:
+            if call.message:
+                await call.message.delete()
+        except Exception:
+            try:
+                await call.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        return await call.answer()
     # hm:<viewer>:<target>:<page>  (old buttons had a rarity part: hm:<viewer>:<target>:<rar>:<page>)
     if len(parts) not in (4, 5) or not call.message:        # also covers hm:noop
         return await call.answer()

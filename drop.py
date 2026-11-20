@@ -321,6 +321,46 @@ async def send_result(m: Message, md: str, html: str) -> None:
                 log.warning("bind result failed (rich=%s styled=%s): %s", rich, styled, e)
 
 
+_wrong_seen: dict[tuple[int, int], float] = {}          # (chat, user) -> last wrong-guess reply (anti spam)
+WRONG_GAP = 8.0
+
+
+def post_link(m: Message, message_id: int | None) -> str | None:
+    """Link to the drop message (public group by username, private supergroup by id). None in basic groups."""
+    if not message_id:
+        return None
+    thread = topic_id(m)
+    mid = f"{thread}/{message_id}" if thread else str(message_id)
+    if m.chat.username:
+        return f"https://t.me/{m.chat.username}/{mid}"
+    cid = str(m.chat.id)
+    if cid.startswith("-100"):
+        return f"https://t.me/c/{cid[4:]}/{mid}"
+    return None
+
+
+async def wrong_guess(m: Message, d) -> None:
+    """Wrong /bind: tell the player and offer a button that jumps back to the drop post."""
+    now = time.monotonic()
+    key = (m.chat.id, m.from_user.id)
+    if now - _wrong_seen.get(key, -1e9) < WRONG_GAP:
+        return
+    _wrong_seen[key] = now
+    if len(_wrong_seen) > 1000:
+        _wrong_seen.clear()
+    text = ("<b>Wrong guess!</b>\n<blockquote>That is not the right name. "
+            "Check the post again and try once more.</blockquote>")
+    link = post_link(m, d["message_id"])
+    try:
+        if link:
+            await with_styles(lambda s: m.reply(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Check the post", url=link, **({"style": "primary"} if s else {}))]])))
+        else:
+            await m.reply(text)
+    except Exception as e:
+        log.warning("wrong guess reply failed: %s", e)
+
+
 @router.message(Command("bind"), F.chat.type.in_(GROUPS))
 async def bind_cmd(m: Message, command: CommandObject):
     if not m.from_user or m.from_user.is_bot:
@@ -333,8 +373,11 @@ async def bind_cmd(m: Message, command: CommandObject):
     if not d:
         return
     c = await db.get_character(d["char_id"])
-    if not c or not name_matches(guess, c["name"]):
-        return                                           # wrong guesses stay silent
+    if not c:
+        return
+    if not name_matches(guess, c["name"]):
+        await wrong_guess(m, d)
+        return
     if not await db.claim_drop(m.chat.id, c["char_id"]):
         return                                           # someone was faster
     u = m.from_user
