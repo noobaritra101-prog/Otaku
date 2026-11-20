@@ -425,7 +425,13 @@ async def finish_upload(bot, st: dict, user) -> str:
         post, stamped = await stamped_post(bot, c, st["kind"], st["file_id"])
         await db.update_character(cid, db_msg_id=post.message_id)
         if st["kind"] == "photo" and not stamped:
-            warn = "\nWatermark could not be added (check bot logs, watermark.ttf must be next to watermark.py)."
+            err = wm.LAST_ERROR or "unknown error"
+            if "timeout" in err.lower() or "network" in err.lower():
+                warn = ("\nWatermark skipped: Telegram timed out while sending the picture to the bot. "
+                        f"Fix it later with /edit {cid} then Picture (send the picture again).")
+            else:
+                warn = (f"\nWatermark could not be added: {escape(err)}"
+                        "\n(watermark.ttf must be next to watermark.py, and Pillow installed)")
     except Exception as e:
         log.warning("post to %s failed: %s", DB_CHAT, e)
         warn = f"\nCould not post to {DB_CHAT}, make the bot admin there."

@@ -13,11 +13,14 @@ from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFont
 
 log = logging.getLogger("watermark")
+LAST_ERROR = ""          # reason of the last failure, shown in the /upload message
 
 TEXT = "Oᴛᴀᴋυ ຖᴇxυʂ"
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONTS = [
     os.path.join(HERE, "watermark.ttf"),
+    os.path.join(os.getcwd(), "watermark.ttf"),
+    os.path.join(HERE, "fonts", "watermark.ttf"),
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
@@ -54,12 +57,31 @@ def _stamp(raw: bytes) -> bytes:
     return out.getvalue()
 
 
+async def _download(bot, file_id: str, tries: int = 3) -> bytes:
+    """getFile + download with short timeouts and retries. Telegram sometimes answers 'Gateway Timeout';
+    waiting for it twice (the default) took 2 minutes, so give up on each try quickly and try again."""
+    last: Exception | None = None
+    for i in range(tries):
+        try:
+            f = await bot.get_file(file_id, request_timeout=15)
+            buf = io.BytesIO()
+            await bot.download_file(f.file_path, destination=buf, timeout=30)
+            return buf.getvalue()
+        except Exception as e:
+            last = e
+            log.warning("watermark download try %s/%s failed: %s", i + 1, tries, e)
+            if i < tries - 1:
+                await asyncio.sleep(1.5 * (i + 1))
+    raise last
+
+
 async def stamp(bot, file_id: str) -> bytes | None:
     """Download a Telegram photo and return it watermarked (JPEG bytes), or None on any failure."""
+    global LAST_ERROR
+    LAST_ERROR = ""
     try:
-        buf = io.BytesIO()
-        await bot.download(file_id, destination=buf)
-        return await asyncio.to_thread(_stamp, buf.getvalue())
-    except Exception:
+        return await asyncio.to_thread(_stamp, await _download(bot, file_id))
+    except Exception as e:
+        LAST_ERROR = f"{type(e).__name__}: {e}"[:120]
         log.exception("watermark failed")
         return None
