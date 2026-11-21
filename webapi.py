@@ -434,19 +434,21 @@ async def _adsave(uid: int, s: dict) -> None:
     await db.set_setting(f"adrw:{uid}", json.dumps(s))
 
 
-# The two adapters below are the only places that touch the card tables. If dbase.py names them differently, change these two lines.
+AD_BLOCKED_SUBS: tuple = ()     # sub rarities (e.g. event cards) that must never be given as a free reward
+
+
 async def _ad_pick_card(rarity: str):
-    fn = getattr(db, "random_character", None)       # -> row with char_id, name, anime, rarity, sub_rarity, media_type (or None)
-    if not fn:
-        raise ApiError(500, "Reward setup missing: dbase.random_character")
-    return await fn(rarity)
+    """A random card of the rolled rarity; if that rarity has none, try the other reward rarities."""
+    order = [rarity] + [r for r, _ in AD_REWARD if r != rarity]
+    for r in order:
+        c = await db.pick_character(r, blocked_subs=AD_BLOCKED_SUBS)
+        if c:
+            return c
+    return None
 
 
 async def _ad_give(uid: int, char_id: int) -> None:
-    fn = getattr(db, "give_card", None)
-    if not fn:
-        raise ApiError(500, "Reward setup missing: dbase.give_card")
-    await fn(uid, char_id)
+    await db.add_to_collection(uid, char_id)
 
 
 async def adreward_state(request: web.Request):
