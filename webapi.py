@@ -401,6 +401,93 @@ async def mines_cash(request: web.Request):
         return web.json_response(await _mend(uid, g, "cash"))
 
 
+# ───────────── reward ads (Adsgram block int-61157): watch 2 ads, get a random card ─────────────
+AD_NEED = 2                     # ads per reward (the page plays them back to back)
+AD_DAILY_CAP = 5                # rewards per user per shop day
+AD_MIN_SECONDS = 6              # two ads cannot honestly finish faster than this
+AD_TOKEN_TTL = 900
+AD_REWARD = (("Common", 40), ("Uncommon", 25), ("Rare", 15))   # relative weights, shown to the user as percentages
+_adlocks: dict[int, asyncio.Lock] = {}
+
+
+def _ad_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + SHOP_UTC_OFFSET_MIN * 60))
+
+
+def _ad_chances() -> list:
+    tot = sum(w for _, w in AD_REWARD)
+    return [[r, round(w * 100 / tot)] for r, w in AD_REWARD]
+
+
+async def _adload(uid: int) -> dict:
+    raw = await db.get_setting(f"adrw:{uid}")
+    try:
+        s = json.loads(raw) if raw else {}
+    except ValueError:
+        s = {}
+    if s.get("day") != _ad_day():
+        s = {"day": _ad_day(), "n": 0}
+    return s
+
+
+async def _adsave(uid: int, s: dict) -> None:
+    await db.set_setting(f"adrw:{uid}", json.dumps(s))
+
+
+# The two adapters below are the only places that touch the card tables. If dbase.py names them differently, change these two lines.
+async def _ad_pick_card(rarity: str):
+    return await db.random_character(rarity)        # -> row with char_id, name, anime, rarity, sub_rarity, media_type (or None)
+
+
+async def _ad_give(uid: int, char_id: int) -> None:
+    await db.give_card(uid, char_id)
+
+
+async def adreward_state(request: web.Request):
+    uid = await _need_user(request)
+    s = await _adload(uid)
+    return web.json_response({"left": max(0, AD_DAILY_CAP - s["n"]), "cap": AD_DAILY_CAP, "need": AD_NEED,
+                              "chances": _ad_chances()})
+
+
+async def adreward_start(request: web.Request):
+    uid = await _need_user(request)
+    async with _adlocks.setdefault(uid, asyncio.Lock()):
+        s = await _adload(uid)
+        if s["n"] >= AD_DAILY_CAP:
+            raise ApiError(429, "No ad rewards left today. Come back tomorrow.")
+        s["tok"], s["t"] = secrets.token_urlsafe(12), time.time()
+        await _adsave(uid, s)
+        return web.json_response({"token": s["tok"]})
+
+
+async def adreward_claim(request: web.Request):
+    uid = await _need_user(request)
+    tok = str((await _body(request)).get("token") or "")
+    async with _adlocks.setdefault(uid, asyncio.Lock()):
+        s = await _adload(uid)
+        want, t0 = s.pop("tok", None), s.pop("t", 0)          # a token works once, whatever happens next
+        await _adsave(uid, s)
+        if not want or not hmac.compare_digest(want, tok):
+            raise ApiError(400, "Start again: press Watch 2 ads.")
+        if time.time() - t0 > AD_TOKEN_TTL:
+            raise ApiError(400, "That took too long. Start again.")
+        if time.time() - t0 < AD_MIN_SECONDS:
+            raise ApiError(400, "Watch both ads to get the reward.")
+        if s["n"] >= AD_DAILY_CAP:
+            raise ApiError(429, "No ad rewards left today. Come back tomorrow.")
+        rarity = secrets.SystemRandom().choices([r for r, _ in AD_REWARD], [w for _, w in AD_REWARD])[0]
+        c = await _ad_pick_card(rarity)
+        if not c:
+            raise ApiError(503, "No card is available right now. Try again later.")
+        await _ad_give(uid, c["char_id"])
+        s["n"] += 1
+        await _adsave(uid, s)
+        return web.json_response({"card": {"id": c["char_id"], "name": c["name"], "series": c["anime"], "rarity": c["rarity"],
+                                           "sub": c["sub_rarity"] or "", "m": KIND.get(c["media_type"], "p")},
+                                  "left": AD_DAILY_CAP - s["n"]})
+
+
 async def start(bot) -> web.AppRunner | None:
     """Start the web server inside the bot process. Never raises: the bot must run even if the web part fails."""
     try:
@@ -411,6 +498,8 @@ async def start(bot) -> web.AppRunner | None:
             web.get("/logo.png", logo), web.get("/api/overview", overview), web.get("/api/collection", collection),
             web.get("/api/mycollection", my_collection), web.get("/api/me", me),
             web.get("/api/shop", shop_list), web.post("/api/shop/buy", shop_buy),
+            web.get("/api/adreward", adreward_state), web.post("/api/adreward/start", adreward_start),
+            web.post("/api/adreward/claim", adreward_claim),
             web.get("/api/mines/state", mines_state), web.post("/api/mines/start", mines_start),
             web.post("/api/mines/open", mines_open), web.post("/api/mines/cash", mines_cash),
             web.get("/api/img/{cid}", picture),
