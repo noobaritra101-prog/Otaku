@@ -382,7 +382,12 @@ async def with_styles(call):
 # ───────────── handlers (owner only) ─────────────
 @router.message(Command("ads"), F.from_user.id == OWNER_ID)
 async def ads_cmd(m: Message):
-    d = await build("today")
+    log.info("/ads from %s", m.from_user.id if m.from_user else None)
+    try:
+        d = await build("today")
+    except Exception as e:
+        log.exception("/ads build failed")
+        return await m.reply(f"Ads panel failed: {type(e).__name__}: {e}")
     if RICH_MESSAGES:
         try:
             await with_styles(lambda s: send_rich(
@@ -392,7 +397,11 @@ async def ads_cmd(m: Message):
             return
         except Exception as e:
             log.warning("rich /ads failed, using HTML: %s", e)
-    await with_styles(lambda s: m.reply(d["html"], reply_markup=kb(d, s)))
+    try:
+        await with_styles(lambda s: m.reply(d["html"], reply_markup=kb(d, s)))
+    except Exception as e:
+        log.exception("/ads send failed")
+        await m.reply(f"Ads panel failed: {type(e).__name__}: {e}")
 
 
 async def show(msg: Message, d: dict) -> None:
