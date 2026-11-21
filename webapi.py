@@ -26,6 +26,7 @@ from urllib.parse import parse_qsl
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+import ads
 import dbase as db
 from configaration import (
     BOT_TOKEN, CURRENCY_NAME, CURRENCY_SYMBOL, DAILY_AMOUNT, DAILY_BIO_AMOUNT, DROP_MAX_EVERY, DROP_MIN_EVERY, GUESS_DAILY_CAP,
@@ -401,22 +402,17 @@ async def mines_cash(request: web.Request):
         return web.json_response(await _mend(uid, g, "cash"))
 
 
-# ───────────── reward ads (Adsgram block int-61157): watch 2 ads, get a random card ─────────────
-AD_NEED = 2                     # ads per reward (the page plays them back to back)
-AD_DAILY_CAP = 5                # rewards per user per shop day
+# ───────────── reward ads (Adsgram block int-61157): watch N ads, get the chosen reward ─────────────
+# Rewards (free cards by rarity, Nex), the ads each one needs and the daily limits are live settings: the owner
+# changes them with /ads (see ads.py). The page sends {"tier": "<key>"} to /api/adreward/start (keys come from
+# /api/adreward -> tiers[].key); without a tier the first enabled reward is used, so the old page keeps working.
 ADSGRAM_SECRET = "3eac2290823c10126530d87a93fbd26c"   # the same value goes in the Adsgram reward URL as &secret=...
 AD_TOKEN_TTL = 900
-AD_REWARD = (("Common", 40), ("Uncommon", 25), ("Rare", 15))   # relative weights, shown to the user as percentages
 _adlocks: dict[int, asyncio.Lock] = {}
 
 
 def _ad_day() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(time.time() + SHOP_UTC_OFFSET_MIN * 60))
-
-
-def _ad_chances() -> list:
-    tot = sum(w for _, w in AD_REWARD)
-    return [[r, round(w * 100 / tot)] for r, w in AD_REWARD]
 
 
 async def _adload(uid: int) -> dict:
@@ -426,7 +422,8 @@ async def _adload(uid: int) -> dict:
     except ValueError:
         s = {}
     if s.get("day") != _ad_day():
-        s = {"day": _ad_day(), "n": 0}
+        s = {"day": _ad_day(), "done": {}}
+    s.setdefault("done", {})
     return s
 
 
@@ -437,41 +434,55 @@ async def _adsave(uid: int, s: dict) -> None:
 AD_BLOCKED_SUBS: tuple = ()     # sub rarities (e.g. event cards) that must never be given as a free reward
 
 
-async def _ad_pick_card(rarity: str):
-    """A random card of the rolled rarity; if that rarity has none, try the other reward rarities."""
-    order = [rarity] + [r for r, _ in AD_REWARD if r != rarity]
-    for r in order:
-        c = await db.pick_character(r, blocked_subs=AD_BLOCKED_SUBS)
-        if c:
-            return c
-    return None
-
-
-async def _ad_give(uid: int, char_id: int) -> None:
-    await db.add_to_collection(uid, char_id)
+def _tier_json(t: dict, s: dict) -> dict:
+    left = max(0, t["daily"] - s["done"].get(t["k"], 0))
+    kind = "luck" if t["k"] == "luck" else "nex" if t["k"] == "nex" else "card"
+    out = {"key": t["k"], "kind": kind, "label": ads.tier_name(t), "ads": t["ads"], "daily": t["daily"], "left": left}
+    if kind == "nex":
+        out["amount"] = t.get("amt", 50)
+    elif kind == "luck":
+        out["chances"] = ads.luck_chances()
+    else:
+        out["rarity"] = t["k"].split(":", 1)[1]
+    return out
 
 
 async def adreward_state(request: web.Request):
     uid = await _need_user(request)
     s = await _adload(uid)
-    return web.json_response({"left": max(0, AD_DAILY_CAP - s["n"]), "cap": AD_DAILY_CAP, "need": AD_NEED,
-                              "chances": _ad_chances()})
+    cfg = await ads.get_cfg()
+    tiers = [_tier_json(t, s) for t in cfg["tiers"] if t["on"]] if cfg["on"] else []
+    first = tiers[0] if tiers else None
+    return web.json_response({
+        "paused": not cfg["on"], "tiers": tiers,
+        # old page fields: the first reward
+        "left": first["left"] if first else 0, "cap": first["daily"] if first else 0, "need": first["ads"] if first else 0,
+        "chances": (first.get("chances") or [[first["label"], 100]]) if first else []})
 
 
 async def adreward_start(request: web.Request):
     uid = await _need_user(request)
+    cfg = await ads.get_cfg()
+    if not cfg["on"]:
+        raise ApiError(503, "Ad rewards are paused right now. Try again later.")
+    key = (await _body(request)).get("tier")
+    tier = ads.find_tier(cfg, str(key)) if key else next((t for t in cfg["tiers"] if t["on"]), None)
+    if not tier:
+        raise ApiError(404, "That reward is not available right now.")
     async with _adlocks.setdefault(uid, asyncio.Lock()):
         s = await _adload(uid)
-        if s["n"] >= AD_DAILY_CAP:
-            raise ApiError(429, "No ad rewards left today. Come back tomorrow.")
+        if s["done"].get(tier["k"], 0) >= tier["daily"]:
+            raise ApiError(429, "No more of this reward today. Come back tomorrow.")
         s["tok"], s["t"], s["seen"] = secrets.token_urlsafe(12), time.time(), 0
+        s["need"], s["tier"] = tier["ads"], tier["k"]
         await _adsave(uid, s)
-        return web.json_response({"token": s["tok"]})
+        await ads.record("start", uid)
+        return web.json_response({"token": s["tok"], "need": tier["ads"], "tier": tier["k"]})
 
 
 async def adsgram_reward(request: web.Request):
     """Adsgram server callback, one call per finished ad:  /adsgram/reward?userid=[userId]&secret=...
-    It only counts the ad for a reward session the user started in the app; the card is given by /api/adreward/claim."""
+    It only counts the ad for a reward session the user started in the app; the reward is given by /api/adreward/claim."""
     if ADSGRAM_SECRET and not hmac.compare_digest(request.query.get("secret", ""), ADSGRAM_SECRET):
         raise web.HTTPForbidden(text="forbidden")
     try:
@@ -483,37 +494,68 @@ async def adsgram_reward(request: web.Request):
         if s.get("tok"):
             s["seen"] = s.get("seen", 0) + 1
             await _adsave(uid, s)
+            await ads.record("ad", uid)
     return web.Response(text="ok")                 # always 200 so Adsgram does not retry
 
 
 async def adreward_claim(request: web.Request):
     uid = await _need_user(request)
     tok = str((await _body(request)).get("token") or "")
+    cfg = await ads.get_cfg()
+    if not cfg["on"]:
+        raise ApiError(503, "Ad rewards are paused right now. Try again later.")
     async with _adlocks.setdefault(uid, asyncio.Lock()):
         s = await _adload(uid)
         want = s.get("tok")
         if not want or not hmac.compare_digest(want, tok):
-            raise ApiError(400, "Start again: press Watch 2 ads.")
+            raise ApiError(400, "Start again: press Watch.")
         if time.time() - s.get("t", 0) > AD_TOKEN_TTL:
             s.pop("tok", None); await _adsave(uid, s)
             raise ApiError(400, "That took too long. Start again.")
-        if s.get("seen", 0) < AD_NEED:             # Adsgram's callbacks can arrive a moment after the ad closes
-            return web.json_response({"pending": True, "seen": s.get("seen", 0)})
-        if s["n"] >= AD_DAILY_CAP:
-            raise ApiError(429, "No ad rewards left today. Come back tomorrow.")
-        rarity = secrets.SystemRandom().choices([r for r, _ in AD_REWARD], [w for _, w in AD_REWARD])[0]
-        c = await _ad_pick_card(rarity)
-        if not c:
-            raise ApiError(503, "No card is available right now. Try again later.")
-        for k in ("tok", "t", "seen"):             # a session pays once
+        tier = ads.find_tier(cfg, s.get("tier"))
+        if not tier:
+            for k in ("tok", "t", "seen", "need", "tier"):
+                s.pop(k, None)
+            await _adsave(uid, s)
+            raise ApiError(404, "That reward is not available any more.")
+        if s.get("seen", 0) < s.get("need", tier["ads"]):    # Adsgram's callbacks can arrive a moment after the ad closes
+            return web.json_response({"pending": True, "seen": s.get("seen", 0), "need": s.get("need", tier["ads"])})
+        if s["done"].get(tier["k"], 0) >= tier["daily"]:
+            raise ApiError(429, "No more of this reward today. Come back tomorrow.")
+        card = None
+        if tier["k"] == "nex":
+            amt = int(tier.get("amt", 50))
+            async with db.nex_lock:
+                await db.add_nex(uid, amt)
+        elif tier["k"] == "luck":
+            # by luck: Common / Uncommon / Rare with the ads.LUCK weights; if the rolled rarity has no card, try the others
+            rolled = secrets.SystemRandom().choices([r for r, _ in ads.LUCK], [w for _, w in ads.LUCK])[0]
+            for r in [rolled] + [x for x, _ in ads.LUCK if x != rolled]:
+                card = await db.pick_character(r, blocked_subs=AD_BLOCKED_SUBS)
+                if card:
+                    break
+            if not card:
+                raise ApiError(503, "No character is available right now. Try again later.")
+            await db.add_to_collection(uid, card["char_id"])
+        else:
+            card = await db.pick_character(tier["k"].split(":", 1)[1], blocked_subs=AD_BLOCKED_SUBS)
+            if not card:
+                raise ApiError(503, "No character is available right now. Try again later.")
+            await db.add_to_collection(uid, card["char_id"])
+        for k in ("tok", "t", "seen", "need", "tier"):     # a session pays once
             s.pop(k, None)
+        s["done"][tier["k"]] = s["done"].get(tier["k"], 0) + 1
         await _adsave(uid, s)
-        await _ad_give(uid, c["char_id"])
-        s["n"] += 1
-        await _adsave(uid, s)
-        return web.json_response({"card": {"id": c["char_id"], "name": c["name"], "series": c["anime"], "rarity": c["rarity"],
-                                           "sub": c["sub_rarity"] or "", "m": KIND.get(c["media_type"], "p")},
-                                  "left": AD_DAILY_CAP - s["n"]})
+        left = max(0, tier["daily"] - s["done"][tier["k"]])
+        if card is None:
+            await ads.record("reward", uid, "Nex", amt)
+            return web.json_response({"nex": amt, "balance": await db.get_nex(uid), "left": left, "tier": tier["k"]})
+        await ads.record("reward", uid, card["rarity"])
+        return web.json_response({"card": {"id": card["char_id"], "name": card["name"], "series": card["anime"],
+                                           "rarity": card["rarity"], "sub": card["sub_rarity"] or "",
+                                           "m": KIND.get(card["media_type"], "p")},
+                                  "left": left, "tier": tier["k"]})
+
 
 async def start(bot) -> web.AppRunner | None:
     """Start the web server inside the bot process. Never raises: the bot must run even if the web part fails."""

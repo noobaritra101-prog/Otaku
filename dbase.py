@@ -286,12 +286,22 @@ CHAR_FIELDS = {"name", "anime", "gender", "rarity", "sub_rarity", "file_id", "db
 
 async def add_character(name: str, anime: str, gender: str, rarity: str, sub_rarity: str | None,
                         file_id: str, added_by: int, artist_name: str,
-                        media_type: str = "photo") -> int:
-    """Insert a card and return its ID (AUTOINCREMENT: IDs keep counting, never reused)."""
+                        media_type: str = "photo", char_id: int | None = None) -> int:
+    """Insert a card and return its ID. AUTOINCREMENT keeps counting and never reuses IDs, unless char_id is given:
+    then the card takes that free ID (fills a gap, e.g. after a delete). A taken ID falls back to the next new one."""
+    vals = (name, anime, gender, rarity, sub_rarity, file_id, added_by, artist_name, media_type)
+    if char_id is not None:
+        try:
+            await _db.execute(
+                "INSERT INTO characters (char_id, name, anime, gender, rarity, sub_rarity, file_id, added_by, artist_name, media_type)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)", (char_id, *vals))
+            await _db.commit()
+            return char_id
+        except aiosqlite.IntegrityError:
+            await _db.rollback()
     cur = await _db.execute(
         "INSERT INTO characters (name, anime, gender, rarity, sub_rarity, file_id, added_by, artist_name, media_type)"
-        " VALUES (?,?,?,?,?,?,?,?,?)",
-        (name, anime, gender, rarity, sub_rarity, file_id, added_by, artist_name, media_type))
+        " VALUES (?,?,?,?,?,?,?,?,?)", vals)
     await _db.commit()
     return cur.lastrowid
 

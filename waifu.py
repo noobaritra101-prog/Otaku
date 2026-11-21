@@ -315,7 +315,8 @@ USAGE = (
     "Reply to a picture, video or GIF (or send it with this as the caption):\n"
     "/upload Series | Character name | Rarity | Sub-rarity\n"
     "The SERIES comes first, then the CHARACTER NAME. Example: /upload Re:Zero | Rem | 4 | -\n"
-    "Rarity: name or number 1-9. Sub-rarity: name or - for none."
+    "Rarity: name or number 1-9. Sub-rarity: name or - for none.\n"
+    "Optional 5th part: a free ID from /gaps to fill it, e.g. | 222"
 )
 
 # Upload preview state: token -> dict. In memory, cleared on restart.
@@ -346,6 +347,9 @@ async def analyse(st: dict) -> dict:
     series_known = bool(existing) or bool(similar)
     series_is_name = k in nkeys
     st["swap"] = (name_is_series and not series_known) or (series_is_name and not existing and not name_is_series)
+    st["gaps"] = await missing_ids()
+    if st.get("fill_id") not in st["gaps"]:
+        st["fill_id"] = None
     return st
 
 
@@ -356,7 +360,8 @@ def preview_text(st: dict) -> str:
         f"Series : {escape(st['series'])}{tag}\n"
         f"Character : {escape(st['name'])}\n"
         f"Rarity : {rarity_label(st['rarity'])}\n"
-        f"Sub-rarity : {sub_label(st['sub'])}</blockquote>"
+        f"Sub-rarity : {sub_label(st['sub'])}\n"
+        f"ID : {st['fill_id'] if st.get('fill_id') else 'next free'}{' (gap)' if st.get('fill_id') else ''}</blockquote>"
     )
     if st["similar"]:
         text += "\n\n<b>A similar series is already in the database.</b>\n<blockquote>"
@@ -378,6 +383,11 @@ def preview_kb(tok: str, st: dict, styled: bool = True) -> InlineKeyboardMarkup:
     else:
         rows.append([b("Upload", "ok", "success")])
     rows.append([b("Swap series and name", "sw", "primary" if st["swap"] else None)])
+    if st.get("gaps"):
+        if st.get("fill_id"):
+            rows.append([b(f"✓ Filling gap ID {st['fill_id']} · use next ID", "gp", "primary")])
+        else:
+            rows.append([b(f"Fill gap: ID {st['gaps'][0]}", "gp")])
     rows.append([b("Cancel", "no", "danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -405,9 +415,15 @@ async def upload_cmd(m: Message, command: CommandObject):
     if sub and sub not in allowed_subs(rarity):
         return await notice(m, "Sub-rarity not allowed", sub_rule_text(rarity))
 
+    fill_id = None
+    if len(parts) > 4 and parts[4]:
+        if not parts[4].isdigit() or int(parts[4]) not in await missing_ids():
+            return await notice(m, "ID not free", "That ID is already used or beyond the last one. Use /gaps to see the free IDs.")
+        fill_id = int(parts[4])
+
     kind, file_id = found
     st = await analyse({"uid": u.id, "series": series, "name": name, "rarity": rarity, "sub": sub,
-                        "kind": kind, "file_id": file_id})
+                        "kind": kind, "file_id": file_id, "fill_id": fill_id})
     _upl_counter += 1
     tok = format(_upl_counter, "x")
     UPLOADS[tok] = st
@@ -418,7 +434,7 @@ async def upload_cmd(m: Message, command: CommandObject):
 
 async def finish_upload(bot, st: dict, user) -> str:
     cid = await db.add_character(st["name"], st["series"], "waifu", st["rarity"], st["sub"], st["file_id"],
-                                 user.id, user.first_name, st["kind"])
+                                 user.id, user.first_name, st["kind"], st.get("fill_id"))
     c = await db.get_character(cid)
     warn = ""
     try:
@@ -485,6 +501,8 @@ async def upload_cb(call: CallbackQuery):
         st["series"] = st["similar"][int(act[2:])]
     elif act == "kp":
         st["keep"] = series_key(st["series"])
+    elif act == "gp":
+        st["fill_id"] = None if st.get("fill_id") else (st.get("gaps") or [None])[0]
     else:
         return await call.answer()
     await analyse(st)
@@ -739,6 +757,49 @@ async def uploaded_cb(call: CallbackQuery):
         return await call.answer()
     await edit_view(call.message, await build_view(view, page))
     await call.answer()
+
+
+# ───────────── /gaps: missing character IDs ─────────────
+def id_ranges(ids: list[int]) -> list[str]:
+    """[222, 224, 225, 226] -> ['222', '224-226']"""
+    out, start, prev = [], None, None
+    for i in ids + [None]:
+        if start is None:
+            start = prev = i
+        elif i is not None and i == prev + 1:
+            prev = i
+        else:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = i
+    return out
+
+
+async def missing_ids() -> list[int]:
+    total = await db.count_characters()
+    rows = await db.list_characters(0, max(total, 1))
+    have = {r["char_id"] for r in rows}
+    top = max(have, default=0)
+    return [i for i in range(1, top + 1) if i not in have]
+
+
+@router.message(Command("gaps"))
+async def gaps_cmd(m: Message):
+    if not await allowed(m.from_user.id if m.from_user else None):
+        return
+    gone = await missing_ids()
+    ranges = id_ranges(gone)
+    body = ", ".join(ranges) if ranges else "None"
+    md = f"## 🕳 ID gaps\n{len(gone)} missing\n\n> {esc(body)}"
+    html = f"<b>🕳 ID gaps</b>\n{len(gone)} missing\n<blockquote>{escape(body)}</blockquote>"
+    if RICH_MESSAGES:
+        try:
+            await send_rich(m.bot, m.chat.id, md,
+                            message_thread_id=m.message_thread_id if m.is_topic_message else None,
+                            reply_to_message_id=m.message_id)
+            return
+        except Exception as e:
+            log.warning("rich /gaps failed, using HTML: %s", e)
+    await m.reply(html)
 
 
 # ───────────── /edit panel ─────────────
