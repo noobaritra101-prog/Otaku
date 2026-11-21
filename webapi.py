@@ -404,7 +404,7 @@ async def mines_cash(request: web.Request):
 # ───────────── reward ads (Adsgram block int-61157): watch 2 ads, get a random card ─────────────
 AD_NEED = 2                     # ads per reward (the page plays them back to back)
 AD_DAILY_CAP = 5                # rewards per user per shop day
-AD_MIN_SECONDS = 6              # two ads cannot honestly finish faster than this
+ADSGRAM_SECRET = "3eac2290823c10126530d87a93fbd26c"   # the same value goes in the Adsgram reward URL as &secret=...
 AD_TOKEN_TTL = 900
 AD_REWARD = (("Common", 40), ("Uncommon", 25), ("Rare", 15))   # relative weights, shown to the user as percentages
 _adlocks: dict[int, asyncio.Lock] = {}
@@ -456,9 +456,26 @@ async def adreward_start(request: web.Request):
         s = await _adload(uid)
         if s["n"] >= AD_DAILY_CAP:
             raise ApiError(429, "No ad rewards left today. Come back tomorrow.")
-        s["tok"], s["t"] = secrets.token_urlsafe(12), time.time()
+        s["tok"], s["t"], s["seen"] = secrets.token_urlsafe(12), time.time(), 0
         await _adsave(uid, s)
         return web.json_response({"token": s["tok"]})
+
+
+async def adsgram_reward(request: web.Request):
+    """Adsgram server callback, one call per finished ad:  /adsgram/reward?userid=[userId]&secret=...
+    It only counts the ad for a reward session the user started in the app; the card is given by /api/adreward/claim."""
+    if ADSGRAM_SECRET and not hmac.compare_digest(request.query.get("secret", ""), ADSGRAM_SECRET):
+        raise web.HTTPForbidden(text="forbidden")
+    try:
+        uid = int(request.query.get("userid", ""))
+    except ValueError:
+        raise web.HTTPBadRequest(text="bad userid")
+    async with _adlocks.setdefault(uid, asyncio.Lock()):
+        s = await _adload(uid)
+        if s.get("tok"):
+            s["seen"] = s.get("seen", 0) + 1
+            await _adsave(uid, s)
+    return web.Response(text="ok")                 # always 200 so Adsgram does not retry
 
 
 async def adreward_claim(request: web.Request):
@@ -466,27 +483,29 @@ async def adreward_claim(request: web.Request):
     tok = str((await _body(request)).get("token") or "")
     async with _adlocks.setdefault(uid, asyncio.Lock()):
         s = await _adload(uid)
-        want, t0 = s.pop("tok", None), s.pop("t", 0)          # a token works once, whatever happens next
-        await _adsave(uid, s)
+        want = s.get("tok")
         if not want or not hmac.compare_digest(want, tok):
             raise ApiError(400, "Start again: press Watch 2 ads.")
-        if time.time() - t0 > AD_TOKEN_TTL:
+        if time.time() - s.get("t", 0) > AD_TOKEN_TTL:
+            s.pop("tok", None); await _adsave(uid, s)
             raise ApiError(400, "That took too long. Start again.")
-        if time.time() - t0 < AD_MIN_SECONDS:
-            raise ApiError(400, "Watch both ads to get the reward.")
+        if s.get("seen", 0) < AD_NEED:             # Adsgram's callbacks can arrive a moment after the ad closes
+            return web.json_response({"pending": True, "seen": s.get("seen", 0)})
         if s["n"] >= AD_DAILY_CAP:
             raise ApiError(429, "No ad rewards left today. Come back tomorrow.")
         rarity = secrets.SystemRandom().choices([r for r, _ in AD_REWARD], [w for _, w in AD_REWARD])[0]
         c = await _ad_pick_card(rarity)
         if not c:
             raise ApiError(503, "No card is available right now. Try again later.")
+        for k in ("tok", "t", "seen"):             # a session pays once
+            s.pop(k, None)
+        await _adsave(uid, s)
         await _ad_give(uid, c["char_id"])
         s["n"] += 1
         await _adsave(uid, s)
         return web.json_response({"card": {"id": c["char_id"], "name": c["name"], "series": c["anime"], "rarity": c["rarity"],
                                            "sub": c["sub_rarity"] or "", "m": KIND.get(c["media_type"], "p")},
                                   "left": AD_DAILY_CAP - s["n"]})
-
 
 async def start(bot) -> web.AppRunner | None:
     """Start the web server inside the bot process. Never raises: the bot must run even if the web part fails."""
@@ -499,7 +518,7 @@ async def start(bot) -> web.AppRunner | None:
             web.get("/api/mycollection", my_collection), web.get("/api/me", me),
             web.get("/api/shop", shop_list), web.post("/api/shop/buy", shop_buy),
             web.get("/api/adreward", adreward_state), web.post("/api/adreward/start", adreward_start),
-            web.post("/api/adreward/claim", adreward_claim),
+            web.post("/api/adreward/claim", adreward_claim), web.get("/adsgram/reward", adsgram_reward),
             web.get("/api/mines/state", mines_state), web.post("/api/mines/start", mines_start),
             web.post("/api/mines/open", mines_open), web.post("/api/mines/cash", mines_cash),
             web.get("/api/img/{cid}", picture),
