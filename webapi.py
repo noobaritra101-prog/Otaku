@@ -545,6 +545,7 @@ async def scramble_solve(request: web.Request):
         if perm != list(range(_SCR_CELLS)):
             raise ApiError(400, "That puzzle is not solved yet.")
         cid = g["id"]
+        secs = max(0.1, round(time.time() - g["t"], 2))   # solve time for the /topscramble board
         s.pop("g", None)                                # a puzzle pays once
         s["streak"] += 1
         show_ad = s["streak"] >= SCRAMBLE_AD_EVERY
@@ -553,6 +554,10 @@ async def scramble_solve(request: web.Request):
         reward = max(0, min(SCRAMBLE_REWARD, SCRAMBLE_DAILY_CAP - s["earn"]))
         s["earn"] += reward
         await _ssave(uid, s)
+        try:
+            await db.scramble_add(uid, secs)            # +1 solved, keeps the fastest time (feeds /topscramble)
+        except Exception:
+            log.exception("scramble stats failed for %s", uid)
         async with db.nex_lock:
             bal = await db.add_nex(uid, reward) if reward else await db.get_nex(uid)
         c = await db.get_character(cid)

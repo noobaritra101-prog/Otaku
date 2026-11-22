@@ -214,7 +214,11 @@ BOARDS = {
     "tw": {"title": "Top Whoami", "media": "topwho",
            "views": {"games": "Total Games", "fast": "Fastest", "wins": "Correct guess"},
            "layout": [["games", "fast"], ["wins"]]},
+    "ts": {"title": "Top Scramble", "media": "topscramble",
+           "views": {"ssolved": "Total Solved", "sfast": "Fastest"},
+           "layout": [["ssolved", "sfast"]]},
 }
+CMD_NAME = {"tp": "/topplayers", "tw": "/topwho", "ts": "/topscramble"}
 
 
 def cut(s: str, n: int) -> str:
@@ -238,8 +242,10 @@ def value_of(view: str, r) -> str:
         return f"{r['uniq']:,} characters"
     if view == "games":
         return f"{r['games']:,} games"
-    if view == "fast":
+    if view in ("fast", "sfast"):
         return f"{r['best']:.2f}s"
+    if view == "ssolved":
+        return f"{r['solved']:,} puzzles"
     return f"{r['wins']:,} correct"
 
 
@@ -281,6 +287,7 @@ async def load(pfx: str, view: str, uid: int):
         "nex": (db.top_nex, db.rank_nex), "col": (db.top_collectors, db.rank_collectors),
         "games": (db.top_games, db.rank_games), "fast": (db.top_fastest, db.rank_fastest),
         "wins": (db.top_whoami, db.rank_whoami),
+        "ssolved": (db.top_scr_solved, db.rank_scr_solved), "sfast": (db.top_scr_fastest, db.rank_scr_fastest),
     }[view]
     return board_view(pfx, view, await fetch[0](n), await fetch[1](uid))
 
@@ -321,7 +328,7 @@ async def _board_cmd(m: Message, pfx: str) -> None:
         await db.upsert_user(u.id, u.username, u.first_name)
         await send_board(m.bot, m.chat.id, pfx, u.id, next(iter(BOARDS[pfx]["views"])), topic_id(m), m.message_id)
     except Exception:
-        log.exception("/%s failed", "topplayers" if pfx == "tp" else "topwho")
+        log.exception("%s failed", CMD_NAME[pfx])
         await notice(m, "Something went wrong", "Try again in a moment.")
 
 
@@ -335,7 +342,12 @@ async def topwho_cmd(m: Message):
     await _board_cmd(m, "tw")
 
 
-@router.callback_query(F.data.regexp(r"^t[pw]:"))
+@router.message(Command("topscramble"))
+async def topscramble_cmd(m: Message):
+    await _board_cmd(m, "ts")
+
+
+@router.callback_query(F.data.regexp(r"^t[pws]:"))
 async def top_cb(call: CallbackQuery):
     parts = (call.data or "").split(":")
     if len(parts) != 3 or not call.message:
@@ -349,8 +361,7 @@ async def top_cb(call: CallbackQuery):
     if view not in BOARDS[pfx]["views"]:
         return await call.answer()
     if call.from_user.id != uid:
-        cmd = "/topplayers" if pfx == "tp" else "/topwho"
-        return await call.answer(f"Only the person who used {cmd} can use these buttons.", show_alert=True)
+        return await call.answer(f"Only the person who used {CMD_NAME[pfx]} can use these buttons.", show_alert=True)
 
     try:
         md, html = await load(pfx, view, uid)
@@ -404,8 +415,7 @@ async def _set_board_media(m: Message, pfx: str, cmd: str) -> None:
     key = BOARDS[pfx]["media"]
     await db.set_setting(f"{key}_file_id", fid)
     await db.set_setting(f"{key}_type", kind)
-    shown = "/topplayers" if pfx == "tp" else "/topwho"
-    await notice(m, "Leaderboard media updated", f"Type: {kind}. Send {shown} to preview.")
+    await notice(m, "Leaderboard media updated", f"Type: {kind}. Send {CMD_NAME[pfx]} to preview.")
 
 
 @router.message(Command("settplayer"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
@@ -416,3 +426,8 @@ async def set_tplayer(m: Message):
 @router.message(Command("settppwho", "settopwho"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
 async def set_topwho(m: Message):
     await _set_board_media(m, "tw", "settppwho")
+
+
+@router.message(Command("settpscramble", "settopscramble"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
+async def set_topscramble(m: Message):
+    await _set_board_media(m, "ts", "settpscramble")

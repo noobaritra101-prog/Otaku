@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS whoami_stats (
     best    REAL
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS scramble_stats (
+    user_id INTEGER PRIMARY KEY,
+    solved  INTEGER NOT NULL DEFAULT 0,
+    best    REAL
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS whoami_wins (
     user_id INTEGER NOT NULL,
     day     TEXT NOT NULL,
@@ -780,6 +786,53 @@ async def rank_fastest(user_id: int) -> int | None:
     if not r or r[0] is None:
         return None
     async with _db.execute("SELECT COUNT(*) FROM whoami_stats WHERE best < ?", (r[0],)) as cur:
+        return (await cur.fetchone())[0] + 1
+
+
+# ---------- Scramble stats (/topscramble) ----------
+async def scramble_add(user_id: int, secs: float) -> None:
+    """One solved Scramble puzzle: +1 solved, keep the fastest solve time."""
+    await _db.execute(
+        "INSERT INTO scramble_stats (user_id, solved, best) VALUES (?,1,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET solved = solved + 1, "
+        "best = CASE WHEN best IS NULL OR ? < best THEN ? ELSE best END",
+        (user_id, secs, secs, secs))
+    await _db.commit()
+
+
+async def top_scr_solved(limit: int = 10):
+    """Most puzzles solved first. Rows: user_id, username, first_name, solved."""
+    async with _db.execute(
+        "SELECT u.user_id, u.username, u.first_name, s.solved FROM scramble_stats s "
+        "JOIN users u ON u.user_id = s.user_id WHERE s.solved > 0 "
+        "ORDER BY s.solved DESC, u.user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def top_scr_fastest(limit: int = 10):
+    """Fastest solve first. Rows: user_id, username, first_name, best."""
+    async with _db.execute(
+        "SELECT u.user_id, u.username, u.first_name, s.best FROM scramble_stats s "
+        "JOIN users u ON u.user_id = s.user_id WHERE s.best IS NOT NULL "
+        "ORDER BY s.best ASC, u.user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def rank_scr_solved(user_id: int) -> int | None:
+    async with _db.execute("SELECT solved FROM scramble_stats WHERE user_id=?", (user_id,)) as cur:
+        r = await cur.fetchone()
+    if not r or r[0] <= 0:
+        return None
+    async with _db.execute("SELECT COUNT(*) FROM scramble_stats WHERE solved > ?", (r[0],)) as cur:
+        return (await cur.fetchone())[0] + 1
+
+
+async def rank_scr_fastest(user_id: int) -> int | None:
+    async with _db.execute("SELECT best FROM scramble_stats WHERE user_id=?", (user_id,)) as cur:
+        r = await cur.fetchone()
+    if not r or r[0] is None:
+        return None
+    async with _db.execute("SELECT COUNT(*) FROM scramble_stats WHERE best < ?", (r[0],)) as cur:
         return (await cur.fetchone())[0] + 1
 
 
