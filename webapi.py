@@ -39,9 +39,9 @@ log = logging.getLogger("otaku.web")
 
 import configaration as _cfg
 SCRAMBLE_GRID = 3                                                   # 3 x 3 = 9 pieces
-SCRAMBLE_EVERY = getattr(_cfg, "SCRAMBLE_EVERY", 3)                 # reward + ad after every N solved puzzles
-SCRAMBLE_REWARD = getattr(_cfg, "SCRAMBLE_REWARD", 150)             # Nex paid on that Nth puzzle
-SCRAMBLE_DAILY_BONUS = getattr(_cfg, "SCRAMBLE_DAILY_BONUS", 10)    # max paid rewards per day (anti-farming)
+SCRAMBLE_REWARD = getattr(_cfg, "SCRAMBLE_REWARD", 25)              # Nex paid for every solved puzzle
+SCRAMBLE_DAILY_CAP = getattr(_cfg, "SCRAMBLE_DAILY_CAP", 2000)      # max Nex a user can earn from Scramble per day
+SCRAMBLE_AD_EVERY = getattr(_cfg, "SCRAMBLE_AD_EVERY", 3)           # the page shows an ad after every N solved puzzles
 SCRAMBLE_MIN_SECS = 4                                               # solved faster than this = rejected
 SCRAMBLE_TTL = 1800                                                 # an unfinished puzzle expires after 30 min
 
@@ -129,7 +129,7 @@ async def overview(request: web.Request):
             "slot": {"spins": SLOT_MAX_SPINS, "jackpot": SLOT_REWARD_JACKPOT, "triple": SLOT_REWARD_TRIPLE,
                      "twoSevens": SLOT_REWARD_TWO_SEVENS, "pair": SLOT_REWARD_PAIR},
             "whoami": {"seconds": GUESS_SECONDS, "reward": GUESS_REWARD, "dailyCap": GUESS_DAILY_CAP},
-            "scramble": {"grid": SCRAMBLE_GRID, "every": SCRAMBLE_EVERY, "reward": SCRAMBLE_REWARD},
+            "scramble": {"grid": SCRAMBLE_GRID, "every": SCRAMBLE_AD_EVERY, "reward": SCRAMBLE_REWARD, "cap": SCRAMBLE_DAILY_CAP},
             "daily": {"amount": DAILY_AMOUNT, "bio": DAILY_BIO_AMOUNT},
         },
         "drop": {"min": DROP_MIN_EVERY, "max": DROP_MAX_EVERY},
@@ -411,12 +411,31 @@ async def mines_cash(request: web.Request):
         return web.json_response(await _mend(uid, g, "cash"))
 
 
-# ───────────── scramble (the character picture is cut into pieces, the player swaps them back) ─────────────
+# ───────────── scramble (the character picture is cut into pieces, the player swaps / drags them back) ─────────────
 # The server picks the character and the shuffle and keeps it; the client sends its list of swaps, the server replays
-# them and only a really solved puzzle counts. Every SCRAMBLE_EVERY solved puzzles pay SCRAMBLE_REWARD Nex and the page
-# shows an ad. Progress lives in settings key scr:<uid> (survives restarts).
+# them and only a really solved puzzle counts. Every solved puzzle pays SCRAMBLE_REWARD Nex up to SCRAMBLE_DAILY_CAP per day,
+# and the page shows an ad after every SCRAMBLE_AD_EVERY puzzles. The NEXT puzzle is chosen in advance (key "nx") and its
+# picture is downloaded into the server cache, so "Next puzzle" opens instantly. Progress lives in settings key scr:<uid>.
 _slocks: dict[int, asyncio.Lock] = {}
+_warm_tasks: set = set()
 _SCR_CELLS = SCRAMBLE_GRID * SCRAMBLE_GRID
+
+
+async def _warm_img(app, cid: int) -> None:
+    """Download a picture into the in-memory cache before anyone asks for it."""
+    if cid in _img:
+        return
+    try:
+        c = await db.get_character(cid)
+        if not c:
+            return
+        buf = io.BytesIO()
+        await app["bot"].download(c["file_id"], destination=buf)
+        _img[cid] = (buf.getvalue(), MIME[KIND.get(c["media_type"], "p")])
+        while len(_img) > 150:
+            _img.popitem(last=False)
+    except Exception as e:
+        log.warning("warm %s failed: %s", cid, e)
 
 
 async def _sload(uid: int) -> dict:
@@ -425,10 +444,10 @@ async def _sload(uid: int) -> dict:
         s = json.loads(raw) if raw else {}
     except ValueError:
         s = {}
-    if s.get("day") != _ad_day():                      # daily counters reset, the streak towards the next bonus stays
-        s["day"], s["bonus"] = _ad_day(), 0
+    if s.get("day") != _ad_day():                      # daily counters reset, the ad streak stays
+        s["day"], s["earn"] = _ad_day(), 0
     s.setdefault("streak", 0)
-    s.setdefault("bonus", 0)
+    s.setdefault("earn", 0)
     g = s.get("g")
     if g and time.time() - g.get("t", 0) > SCRAMBLE_TTL:
         s.pop("g", None)
@@ -440,28 +459,50 @@ async def _ssave(uid: int, s: dict) -> None:
 
 
 def _sjson(s: dict) -> dict:
-    out = {"grid": SCRAMBLE_GRID, "every": SCRAMBLE_EVERY, "reward": SCRAMBLE_REWARD, "streak": s["streak"],
-           "bonusLeft": max(0, SCRAMBLE_DAILY_BONUS - s["bonus"])}
+    out = {"grid": SCRAMBLE_GRID, "every": SCRAMBLE_AD_EVERY, "reward": SCRAMBLE_REWARD, "cap": SCRAMBLE_DAILY_CAP,
+           "earn": s["earn"], "streak": s["streak"]}
     g = s.get("g")
     if g:
         out["game"] = {"id": g["id"], "perm": g["perm"], "t": int(time.time() - g["t"])}
+    if s.get("nx"):
+        out["next"] = {"id": s["nx"]["id"]}            # the client preloads this picture
     return out
 
 
-async def _scr_card():
+async def _scr_make(app) -> dict | None:
+    """Pick a photo card + a shuffle; warm its picture in the background."""
     rng = secrets.SystemRandom()
+    c = None
     for _ in range(8):                                  # photo cards only (videos cannot be cut into pieces)
         r = rng.choices(["Common", "Uncommon", "Rare"], [5, 3, 2])[0]
-        c = await db.pick_character(r, blocked_subs=AD_BLOCKED_SUBS)
-        if c and KIND.get(c["media_type"], "p") == "p":
-            return c
-    return None
+        x = await db.pick_character(r, blocked_subs=AD_BLOCKED_SUBS)
+        if x and KIND.get(x["media_type"], "p") == "p":
+            c = x
+            break
+    if not c:
+        return None
+    perm = list(range(_SCR_CELLS))
+    while perm == list(range(_SCR_CELLS)):
+        rng.shuffle(perm)
+    t = asyncio.create_task(_warm_img(app, c["char_id"]))
+    _warm_tasks.add(t)
+    t.add_done_callback(_warm_tasks.discard)
+    return {"id": c["char_id"], "perm": perm}
 
 
 async def scramble_state(request: web.Request):
     uid = await _need_user(request)
     async with _slocks.setdefault(uid, asyncio.Lock()):
         s = await _sload(uid)
+        if not s.get("nx"):                             # always have the next puzzle ready
+            nx = await _scr_make(request.app)
+            if nx:
+                s["nx"] = nx
+                await _ssave(uid, s)
+        elif s["nx"]["id"] not in _img:
+            t = asyncio.create_task(_warm_img(request.app, s["nx"]["id"]))
+            _warm_tasks.add(t)
+            t.add_done_callback(_warm_tasks.discard)
         return web.json_response({**_sjson(s), "balance": await db.get_nex(uid)})
 
 
@@ -469,14 +510,13 @@ async def scramble_new(request: web.Request):
     uid = await _need_user(request)
     async with _slocks.setdefault(uid, asyncio.Lock()):
         s = await _sload(uid)
-        c = await _scr_card()
-        if not c:
+        nxt = s.pop("nx", None) or await _scr_make(request.app)
+        if not nxt:
             raise ApiError(503, "No picture is available right now. Try again later.")
-        perm = list(range(_SCR_CELLS))
-        rng = secrets.SystemRandom()
-        while perm == list(range(_SCR_CELLS)):
-            rng.shuffle(perm)
-        s["g"] = {"id": c["char_id"], "perm": perm, "t": time.time()}
+        s["g"] = {"id": nxt["id"], "perm": nxt["perm"], "t": time.time()}
+        fresh = await _scr_make(request.app)            # prepare the one after this
+        if fresh:
+            s["nx"] = fresh
         await _ssave(uid, s)
         return web.json_response({**_sjson(s), "balance": await db.get_nex(uid)})
 
@@ -507,20 +547,18 @@ async def scramble_solve(request: web.Request):
         cid = g["id"]
         s.pop("g", None)                                # a puzzle pays once
         s["streak"] += 1
-        round_done = s["streak"] >= SCRAMBLE_EVERY
-        reward = 0
-        if round_done:
+        show_ad = s["streak"] >= SCRAMBLE_AD_EVERY
+        if show_ad:
             s["streak"] = 0
-            if s["bonus"] < SCRAMBLE_DAILY_BONUS:
-                s["bonus"] += 1
-                reward = SCRAMBLE_REWARD
+        reward = max(0, min(SCRAMBLE_REWARD, SCRAMBLE_DAILY_CAP - s["earn"]))
+        s["earn"] += reward
         await _ssave(uid, s)
         async with db.nex_lock:
             bal = await db.add_nex(uid, reward) if reward else await db.get_nex(uid)
         c = await db.get_character(cid)
         card = {"name": c["name"], "series": c["anime"], "rarity": c["rarity"], "sub": c["sub_rarity"] or ""} if c else {}
-        return web.json_response({"ok": True, "card": card, "reward": reward, "ad": round_done, "balance": bal,
-                                  **_sjson(s)})
+        return web.json_response({"ok": True, "card": card, "reward": reward, "ad": show_ad,
+                                  "capped": s["earn"] >= SCRAMBLE_DAILY_CAP, "balance": bal, **_sjson(s)})
 
 
 # ───────────── reward ads (Adsgram block int-61157): watch N ads, get the chosen reward ─────────────
