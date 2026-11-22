@@ -554,29 +554,51 @@ async def transfer_character(from_id: int, to_id: int, char_id: int) -> bool:
 _AKEY = "LOWER(TRIM(ch.anime))"
 
 
-async def collection_anime_count(user_id: int) -> int:
-    """Number of different series the user owns at least one character of."""
-    async with _db.execute(f"SELECT COUNT(DISTINCT {_AKEY}) {_OWNED}", (user_id,)) as cur:
+async def collection_anime_count(user_id: int, rarity: str | None = None) -> int:
+    """Number of different series the user owns at least one character of (optionally only of one rarity)."""
+    sql, args = f"SELECT COUNT(DISTINCT {_AKEY}) {_OWNED}", [user_id]
+    if rarity:
+        sql += " AND ch.rarity=?"
+        args.append(rarity)
+    async with _db.execute(sql, args) as cur:
         return (await cur.fetchone())[0]
 
 
-async def collection_anime_page(user_id: int, offset: int = 0, limit: int = 5):
-    """Series of a user's collection: most collected first. Rows: akey, anime, collected, total."""
+_SERIES_ORDER = {
+    "most": "collected DESC, akey",             # most collected first (default)
+    "az": "akey",                               # A to Z
+    "new": "MAX(c.first_at) DESC, akey",        # most recently bound first
+}
+
+
+async def collection_anime_page(user_id: int, offset: int = 0, limit: int = 5,
+                                rarity: str | None = None, order: str = "most"):
+    """Series of a user's collection. Rows: akey, anime, collected, total.
+    rarity = only count / show that rarity; order = most / az / new."""
+    where, args = "", [user_id]
+    if rarity:
+        where = " AND ch.rarity=?"
+        args.append(rarity)
     sql = (f"SELECT {_AKEY} AS akey, MIN(ch.anime) AS anime, COUNT(*) AS collected, "
            f"(SELECT COUNT(*) FROM characters t WHERE LOWER(TRIM(t.anime)) = {_AKEY}) AS total "
-           f"{_OWNED} GROUP BY akey ORDER BY collected DESC, akey LIMIT ? OFFSET ?")
-    async with _db.execute(sql, (user_id, limit, offset)) as cur:
+           f"{_OWNED}{where} GROUP BY akey ORDER BY {_SERIES_ORDER.get(order, _SERIES_ORDER['most'])} "
+           f"LIMIT ? OFFSET ?")
+    async with _db.execute(sql, (*args, limit, offset)) as cur:
         return await cur.fetchall()
 
 
-async def collection_by_animes(user_id: int, keys: list[str]):
+async def collection_by_animes(user_id: int, keys: list[str], rarity: str | None = None):
     """A user's characters inside the given series keys (akey), ordered by series then ID."""
     if not keys:
         return []
+    where, args = "", [user_id]
+    if rarity:
+        where = " AND ch.rarity=?"
+        args.append(rarity)
     sql = (f"SELECT ch.char_id, ch.name, ch.anime, ch.rarity, ch.sub_rarity, ch.file_id, ch.media_type, "
-           f"c.qty, {_AKEY} AS akey {_OWNED} AND {_AKEY} IN ({','.join('?' * len(keys))}) "
+           f"c.qty, {_AKEY} AS akey {_OWNED}{where} AND {_AKEY} IN ({','.join('?' * len(keys))}) "
            f"ORDER BY akey, ch.char_id")
-    async with _db.execute(sql, (user_id, *keys)) as cur:
+    async with _db.execute(sql, (*args, *keys)) as cur:
         return await cur.fetchall()
 
 
