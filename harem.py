@@ -215,8 +215,8 @@ BOARDS = {
            "views": {"games": "Total Games", "fast": "Fastest", "wins": "Correct guess"},
            "layout": [["games", "fast"], ["wins"]]},
     "ts": {"title": "Top Scramble", "media": "topscramble",
-           "views": {"ssolved": "Total Solved", "sfast": "Fastest"},
-           "layout": [["ssolved", "sfast"]]},
+           "views": {"ssolved": "Total Solved", "sfast": "Fastest", "searned": "Total Nex Earned"},
+           "layout": [["ssolved", "sfast"], ["searned"]]},
 }
 CMD_NAME = {"tp": "/topplayers", "tw": "/topwho", "ts": "/topscramble"}
 
@@ -246,6 +246,8 @@ def value_of(view: str, r) -> str:
         return f"{r['best']:.2f}s"
     if view == "ssolved":
         return f"{r['solved']:,} puzzles"
+    if view == "searned":
+        return f"{r['earned']:,} {SYM}"
     return f"{r['wins']:,} correct"
 
 
@@ -288,6 +290,7 @@ async def load(pfx: str, view: str, uid: int):
         "games": (db.top_games, db.rank_games), "fast": (db.top_fastest, db.rank_fastest),
         "wins": (db.top_whoami, db.rank_whoami),
         "ssolved": (db.top_scr_solved, db.rank_scr_solved), "sfast": (db.top_scr_fastest, db.rank_scr_fastest),
+        "searned": (db.top_scr_earned, db.rank_scr_earned),
     }[view]
     return board_view(pfx, view, await fetch[0](n), await fetch[1](uid))
 

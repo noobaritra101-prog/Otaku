@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS whoami_stats (
 CREATE TABLE IF NOT EXISTS scramble_stats (
     user_id INTEGER PRIMARY KEY,
     solved  INTEGER NOT NULL DEFAULT 0,
-    best    REAL
+    best    REAL,
+    earned  INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS whoami_wins (
@@ -790,14 +791,32 @@ async def rank_fastest(user_id: int) -> int | None:
 
 
 # ---------- Scramble stats (/topscramble) ----------
-async def scramble_add(user_id: int, secs: float) -> None:
-    """One solved Scramble puzzle: +1 solved, keep the fastest solve time."""
+async def scramble_add(user_id: int, secs: float, earned: int = 0) -> None:
+    """One solved Scramble puzzle: +1 solved, keep the fastest solve time, add the Nex it paid."""
     await _db.execute(
-        "INSERT INTO scramble_stats (user_id, solved, best) VALUES (?,1,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET solved = solved + 1, "
+        "INSERT INTO scramble_stats (user_id, solved, best, earned) VALUES (?,1,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET solved = solved + 1, earned = earned + excluded.earned, "
         "best = CASE WHEN best IS NULL OR ? < best THEN ? ELSE best END",
-        (user_id, secs, secs, secs))
+        (user_id, secs, earned, secs, secs))
     await _db.commit()
+
+
+async def top_scr_earned(limit: int = 10):
+    """Most Nex earned from Scramble first. Rows: user_id, username, first_name, earned."""
+    async with _db.execute(
+        "SELECT u.user_id, u.username, u.first_name, s.earned FROM scramble_stats s "
+        "JOIN users u ON u.user_id = s.user_id WHERE s.earned > 0 "
+        "ORDER BY s.earned DESC, u.user_id LIMIT ?", (limit,)) as cur:
+        return await cur.fetchall()
+
+
+async def rank_scr_earned(user_id: int) -> int | None:
+    async with _db.execute("SELECT earned FROM scramble_stats WHERE user_id=?", (user_id,)) as cur:
+        r = await cur.fetchone()
+    if not r or r[0] <= 0:
+        return None
+    async with _db.execute("SELECT COUNT(*) FROM scramble_stats WHERE earned > ?", (r[0],)) as cur:
+        return (await cur.fetchone())[0] + 1
 
 
 async def top_scr_solved(limit: int = 10):

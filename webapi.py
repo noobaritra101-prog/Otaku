@@ -555,7 +555,7 @@ async def scramble_solve(request: web.Request):
         s["earn"] += reward
         await _ssave(uid, s)
         try:
-            await db.scramble_add(uid, secs)            # +1 solved, keeps the fastest time (feeds /topscramble)
+            await db.scramble_add(uid, secs, reward)            # +1 solved, keeps the fastest time (feeds /topscramble)
         except Exception:
             log.exception("scramble stats failed for %s", uid)
         async with db.nex_lock:
