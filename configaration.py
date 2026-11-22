@@ -103,6 +103,15 @@ SUB_RARITIES = [
     ("Jungle", "🌳", "Jungle"),
     ("Police", "👮", "Police uniform"),
     ("Gamer", "🎮", "Gamer"),
+    ("Doctor", "🩺", "Doctor"),
+    ("Football", "⚽", "Football"),
+    ("Dragon", "🐉", "Dragon"),
+    ("Mermaid", "🧜", "Mermaid"),
+    ("Ninja", "🥷", "Ninja"),
+    ("Witch", "🧙", "Witch"),
+    ("Badminton", "🏸", "Badminton"),
+    ("Racing", "🏎️", "Racing"),
+    ("Volleyball", "🏐", "Volleyball"),
 ]
 
 # Which sub rarities a main rarity may carry (rarity name -> allowed sub names).

@@ -494,17 +494,29 @@ def sort_view(p: dict) -> tuple[str, str]:
     return md, html
 
 
-def sort_kb(uid: int, p: dict, styled: bool = True) -> InlineKeyboardMarkup:
-    def b(label: str, data: str, on: bool = False) -> InlineKeyboardButton:
-        extra = {"style": "primary"} if (on and styled) else {}
+SORT_SECTIONS = {"s": "Series order", "c": "Cards order", "r": "Rarity"}      # the group buttons on the main panel
+
+
+def sort_kb(uid: int, p: dict, view: str = "main", styled: bool = True) -> InlineKeyboardMarkup:
+    """view = main (one button per setting group) or s / c / r (the options of that group)."""
+    def b(label: str, data: str, style: str | None = None, on: bool = False) -> InlineKeyboardButton:
+        style = "primary" if on else style
+        extra = {"style": style} if (style and styled) else {}
         return InlineKeyboardButton(text=(f"• {label}" if (on and not styled) else label),
                                     callback_data=data, **extra)
 
-    rows = [[b(t, f"srt:{uid}:s:{k}", p["s"] == k) for k, t in SORT_SERIES.items()],
-            [b(t, f"srt:{uid}:c:{k}", p["c"] == k) for k, t in SORT_CARDS.items()]]
-    rar = [b(t, f"srt:{uid}:r:{i}", p["r"] == k) for i, (k, t) in enumerate(SORT_RARS)]
-    rows += [rar[i:i + 3] for i in range(0, len(rar), 3)]
-    rows.append([b("Reset", f"srt:{uid}:x:0"), b("Close", f"srt:{uid}:z:0")])
+    if view == "s":
+        rows = [[b(t, f"srt:{uid}:s:{k}", on=p["s"] == k) for k, t in SORT_SERIES.items()]]
+    elif view == "c":
+        rows = [[b(t, f"srt:{uid}:c:{k}", on=p["c"] == k) for k, t in SORT_CARDS.items()]]
+    elif view == "r":
+        rar = [b(t, f"srt:{uid}:r:{i}", on=p["r"] == k) for i, (k, t) in enumerate(SORT_RARS)]
+        rows = [rar[i:i + 3] for i in range(0, len(rar), 3)]
+    else:
+        rows = [[b(t, f"srt:{uid}:v:{k}", "primary") for k, t in SORT_SECTIONS.items()]]
+    if view != "main":
+        rows.append([b("Back", f"srt:{uid}:v:main")])
+    rows.append([b("Reset", f"srt:{uid}:x:0", "danger"), b("Close", f"srt:{uid}:z:0", "danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -525,7 +537,7 @@ async def sort_cmd(m: Message):
     combos = ([("rich", bn), ("rich", None)] if RICH_MESSAGES else []) + [("html", bn), ("html", None)]
     for kind, media in combos:
         for styled in (True, False):
-            kb = sort_kb(u.id, p, styled)
+            kb = sort_kb(u.id, p, "main", styled)
             try:
                 if kind == "rich":
                     await richmsg.send_rich(m.bot, m.chat.id, md, media=media, reply_markup=kb,
@@ -560,19 +572,25 @@ async def sort_cb(call: CallbackQuery):
             except Exception:
                 pass
         return await call.answer()
+    view, note = "main", None                               # screen to show after this press
     try:
         p = await get_prefs(uid)
-        if field == "x":
-            p = dict(SORT_DEFAULT)
-        elif field == "s" and val in SORT_SERIES:
-            p["s"] = val
-        elif field == "c" and val in SORT_CARDS:
-            p["c"] = val
-        elif field == "r" and val.isdigit() and int(val) < len(SORT_RARS):
-            p["r"] = SORT_RARS[int(val)][0]
+        if field == "v":                                    # open a group (or go back to the main panel)
+            view = val if val in SORT_SECTIONS else "main"
+        elif field == "x":
+            p, note = dict(SORT_DEFAULT), "Reset"
+            await db.set_setting(f"hsort:{uid}", json.dumps(p))
         else:
-            return await call.answer()
-        await db.set_setting(f"hsort:{uid}", json.dumps(p))
+            if field == "s" and val in SORT_SERIES:
+                p["s"] = val
+            elif field == "c" and val in SORT_CARDS:
+                p["c"] = val
+            elif field == "r" and val.isdigit() and int(val) < len(SORT_RARS):
+                p["r"] = SORT_RARS[int(val)][0]
+            else:
+                return await call.answer()
+            view, note = field, "Saved"                     # stay inside the group that was changed
+            await db.set_setting(f"hsort:{uid}", json.dumps(p))
     except Exception:
         log.exception("/sort callback database error")
         return await call.answer("Something went wrong.", show_alert=True)
@@ -580,7 +598,7 @@ async def sort_cb(call: CallbackQuery):
     media = await sort_banner()
     for rich in ((True, False) if RICH_MESSAGES else (False,)):
         for styled in (True, False):
-            kb = sort_kb(uid, p, styled)
+            kb = sort_kb(uid, p, view, styled)
             try:
                 if rich:
                     await richmsg.edit_rich(call.bot, msg.chat.id, msg.message_id, md, reply_markup=kb, media=media)
@@ -589,12 +607,12 @@ async def sort_cb(call: CallbackQuery):
                 else:
                     await call.bot.edit_message_caption(chat_id=msg.chat.id, message_id=msg.message_id,
                                                         caption=html, reply_markup=kb)
-                return await call.answer("Saved")
+                return await call.answer(note)
             except Exception as e:
                 if "not modified" in str(e).lower():
-                    return await call.answer("Saved")
+                    return await call.answer(note)
                 log.debug("/sort edit failed (rich=%s styled=%s): %s", rich, styled, e)
-    await call.answer("Saved")                              # the choice is saved even if the panel could not refresh
+    await call.answer(note)                                 # the choice is saved even if the panel could not refresh
 
 
 @router.message(Command("settsort"), F.from_user.id.in_({OWNER_ID, *CO_OWNERS}))
